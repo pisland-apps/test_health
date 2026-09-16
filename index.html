@@ -112,7 +112,7 @@
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
     script-src 'self';
-    style-src 'self' 'sha256-QUn+0G1I6fmMyoVZR/wlCYhE3x32+JsJAx9xGN4uwDg=';
+    style-src 'self' 'sha256-wZY2O4EaSixLAY8ppr8nayWnNzpbd+T0pJChX+x4kAk=';
     img-src 'self' data: blob:;
     font-src 'self';
     connect-src 'self';
@@ -322,7 +322,7 @@
     /* Attachment viewer can be opened from inside another modal (e.g. the ledger
        modal) - it must always render above whichever modal is already open,
        regardless of each element's position in the HTML source order. */
-    #attachmentViewerModal { z-index: 200; }
+    #attachmentViewerModal { z-index: 200; background: rgba(0,0,0,0.85); }
     .modal-overlay.active { display: flex; }
     .modal { background: var(--surface); border-radius: var(--radius); width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto; padding: 24px; position: relative; }
     .modal-close-x { position: absolute; top: 14px; right: 14px; cursor: pointer; font-size: 18px; line-height: 1; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border-radius: 50%; color: var(--text-secondary); z-index: 5; }
@@ -478,7 +478,9 @@
 .s-8588e44d { width:100%; }
 .s-8f340078 { font-size:11px;color:var(--text-secondary);margin-top:8px; }
 .s-8fdce8d5 { text-decoration:none; }
-.s-903e43f6 { max-width:720px; }
+.s-903e43f6 { max-width:95vw; width:95vw; max-height:88vh; padding:0; display:flex; flex-direction:column; overflow:hidden; }
+.s-903e43f6 .modal-header { flex-shrink:0; margin-bottom:0; padding:16px 16px 10px; word-break:break-all; }
+.s-903e43f6 .modal-actions { flex-shrink:0; margin-top:0; padding:14px 16px; border-top:1px solid var(--border-color); flex-wrap:wrap; }
 .s-9155c939 { color:var(--text-secondary); }
 .s-93b8ea5b { display:none; }
 .s-952fb81a { display:flex;justify-content:space-between;align-items:center;background:var(--bg);padding:10px 12px;border-radius:8px; }
@@ -500,7 +502,7 @@
 .s-afed93ca { font-size:12px;color:var(--text-secondary);margin-bottom:10px; }
 .s-b19c5286 { font-size: 11px; color: var(--text-secondary); margin-top: 4px; }
 .s-b30e2c0f { margin-bottom:8px; }
-.s-b5219e15 { display:flex;align-items:center;justify-content:center;min-height:200px;background:var(--bg);border-radius:8px;overflow:hidden; }
+.s-b5219e15 { display:flex;flex-direction:column;align-items:center;gap:12px;flex:1 1 auto;min-height:0;overflow-y:auto;background:var(--bg);padding:12px 16px; }
 .s-b6396cf3 { text-align:right;margin-top:6px; }
 .s-b7fd2bd9 { display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px; }
 .s-b9373de3 { color:var(--text-secondary);text-align:center;padding:40px; }
@@ -571,6 +573,22 @@
        an unsupported browser, not encryption strength (the actual encryption is unaffected;
        this is purely a visual masking / browser-heuristic concern). */
     .s-passcode-mask { -webkit-text-security: disc; text-security: disc; }
+    /* On-screen numpad for the two "enter your existing passcode" screens
+       (app lock screen + attachment unlock modal). Paired with
+       inputmode="none" on the passcode <input> above, which stops the OS
+       virtual keyboard from popping up when that field gets focus/programmatic
+       value changes -- tapping a numpad button never calls .focus() on the
+       input, it only writes to .value, so the keyboard stays down on mobile.
+       The ⌨️ button flips inputmode back to text and focuses the input, for
+       the (uncommon but supported) case of a passcode containing letters. */
+    .numpad { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin: 2px 0 16px; }
+    .numpad-btn { padding:16px 0; font-size:22px; font-weight:600; line-height:1; border-radius:10px; border:1px solid var(--border); background:var(--surface); color:var(--text); cursor:pointer; touch-action:manipulation; -webkit-tap-highlight-color:transparent; user-select:none; }
+    .numpad-btn:active { background:var(--primary-light); border-color:var(--primary); }
+    .numpad-btn-action { font-size:17px; color:var(--text-secondary); background:var(--bg); }
+    @media (min-width: 480px) {
+      .numpad-btn { padding:20px 0; font-size:26px; }
+      .numpad-btn-action { font-size:19px; }
+    }
     .s-ledger-row { transition: background-color 0.4s ease; }
     .s-ledger-flash { background-color: var(--primary-light, #dbeafe) !important; }
     .s-quotafill { height:100%; border-radius:999px; }
@@ -594,7 +612,21 @@
       <h2 class="s-bdfc2dc5">Family Health & Shield is Locked</h2>
       <p class="s-02225414">Enter your passcode to unlock your data.</p>
       <div class="form-group">
-        <input type="text" class="form-input s-passcode-mask" id="appLockPasscodeInput" placeholder="Passcode" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <input type="text" class="form-input s-passcode-mask" id="appLockPasscodeInput" placeholder="Passcode" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="none">
+      </div>
+      <div class="numpad" id="appLockNumpad">
+        <button type="button" class="numpad-btn" data-numpad-digit="1">1</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="2">2</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="3">3</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="4">4</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="5">5</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="6">6</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="7">7</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="8">8</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="9">9</button>
+        <button type="button" class="numpad-btn numpad-btn-action" id="appLockNumpadToggle" title="Passcode has letters? Switch to keyboard">⌨️</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="0">0</button>
+        <button type="button" class="numpad-btn numpad-btn-action" id="appLockNumpadBackspace" title="Backspace">⌫</button>
       </div>
       <div id="appLockError" class="s-0100dc7f"></div>
       <button class="btn btn-primary s-8588e44d" id="btnAppLockUnlock">Unlock</button>
@@ -923,7 +955,21 @@
       <button class="btn btn-secondary s-50204300" id="btnBioUnlock">🫆 Unlock with Face ID / Fingerprint</button>
       <div id="bioUnlockDivider" class="s-79e8385f">or enter passcode</div>
       <div class="form-group">
-        <input type="text" class="form-input s-passcode-mask" id="unlockPasscodeInput" placeholder="Passcode" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <input type="text" class="form-input s-passcode-mask" id="unlockPasscodeInput" placeholder="Passcode" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="none">
+      </div>
+      <div class="numpad" id="unlockNumpad">
+        <button type="button" class="numpad-btn" data-numpad-digit="1">1</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="2">2</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="3">3</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="4">4</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="5">5</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="6">6</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="7">7</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="8">8</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="9">9</button>
+        <button type="button" class="numpad-btn numpad-btn-action" id="unlockNumpadToggle" title="Passcode has letters? Switch to keyboard">⌨️</button>
+        <button type="button" class="numpad-btn" data-numpad-digit="0">0</button>
+        <button type="button" class="numpad-btn numpad-btn-action" id="unlockNumpadBackspace" title="Backspace">⌫</button>
       </div>
       <div id="unlockError" class="s-e36c2361"></div>
       <div class="modal-actions">
@@ -1120,6 +1166,7 @@
             <select class="form-select" id="insLMethod">
               <option value="Bank Transfer">Bank Transfer</option>
               <option value="Auto-Debit">Auto-Debit</option>
+              <option value="Credit Card">Credit Card</option>
               <option value="Cash">Cash</option>
               <option value="Cheque">Cheque</option>
               <option value="Cash Bonus">Paid via Accumulated Cash Bonus</option>
@@ -1192,6 +1239,15 @@
         <div class="form-group s-a2d48c76">
           <label class="form-label">Non-Guaranteed Value</label>
           <input class="form-input" type="number" step="0.01" id="insSNonGuaranteed" placeholder="e.g. 3000">
+        </div>
+        <div class="form-group s-506be65f">
+          <label class="form-label">Attachment (statement / proof document)</label>
+          <input type="file" id="insSAttachments" multiple accept="image/*,.pdf" class="s-cb458930">
+          <div class="file-input-area s-29243394" id="insSFileDropArea">
+            <div class="s-c91e236c">📎</div>
+            <div class="s-6378db95">Click to select files</div>
+          </div>
+          <div class="attachment-list" id="insSAttachmentPreview"></div>
         </div>
         <div class="s-a18aecfa">
           <button type="button" class="btn btn-primary btn-sm" id="insBtnAddSurrenderEntry">+ Add Statement Record</button>

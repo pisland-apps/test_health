@@ -7,8 +7,8 @@
     // Service Worker and has no effect on caching. It does NOT auto-sync with
     // CACHE_VERSION in service-worker.js since they live in different files — bump both
     // together on every deploy. (Reminder comment also left in service-worker.js.)
-    const APP_VERSION = 'v24';
-    const APP_VERSION_DATE = '2026-08-12';
+    const APP_VERSION = 'v32';
+    const APP_VERSION_DATE = '2026-09-17';
     // Populate the badge immediately — app.js is loaded at the end of <body>, so the DOM
     // (including #versionBadge) already exists by the time this line runs. Deliberately
     // done at top level, not inside init()/initAppData(), so it renders before any
@@ -179,6 +179,215 @@
       return value;
     }
 
+    // Deep-clones a value (structuredClone where available, JSON round-trip
+    // fallback) and THEN runs sanitizeIdsDeep on the clone. Deliberately
+    // separate from sanitizeIdsDeep itself: that function mutates its input
+    // in place and returns the same reference, which is fine for its one
+    // existing caller (a disposable just-parsed import blob) but wrong for
+    // "keep both" merge-conflict resolutions, which need an INDEPENDENT
+    // copy with new ids - reusing sanitizeIdsDeep directly there would
+    // remap the ORIGINAL entity's ids instead of producing a duplicate.
+    function deepCloneAndRemapIds(value) {
+      const clone = (typeof structuredClone === 'function')
+        ? structuredClone(value)
+        : JSON.parse(JSON.stringify(value));
+      return sanitizeIdsDeep(clone);
+    }
+
+    // ========== SYNC METADATA (field/array-level merge support) ==========
+    // See MERGE_SYNC_DESIGN.md for the full semantics. Summary: `version` is
+    // a Lamport logical clock (bumped on every local edit, set to
+    // max(local,remote)+1 on merge) - NOT a wall-clock timestamp, and never
+    // compared across devices' clocks. `updatedAt` is wall-clock but is
+    // display-only and must never be read by any merge/conflict logic.
+    // `deletedAt` is a tombstone marker (soft delete). `schemaVersion` is
+    // for future field-shape migrations of this one entity.
+    const SYNC_SCHEMA_VERSION = 1;
+
+    function nowIso() {
+      return new Date().toISOString();
+    }
+
+    // Attach fresh sync metadata to a brand-new entity (member, record,
+    // reminder, policy, ledger row, coverage, rider, sumInsuredHistory
+    // entry, claim, surrender record, ...). Call this once at creation time;
+    // call bumpVersion() on every subsequent edit.
+    function freshSyncMeta() {
+      return { version: 1, updatedAt: nowIso(), deletedAt: null, schemaVersion: SYNC_SCHEMA_VERSION };
+    }
+
+    // Call on every local edit to an entity that already has sync metadata
+    // (i.e. after migration, everything). Mutates in place.
+    function bumpVersion(entity) {
+      if (!entity || typeof entity !== 'object') return entity;
+      entity.version = (Number.isFinite(entity.version) ? entity.version : 1) + 1;
+      entity.updatedAt = nowIso();
+      return entity;
+    }
+
+    // Persistent per-device identity, used only for conflict-queue
+    // provenance/debugging (see design doc 1.3) - NEVER as a tie-breaker in
+    // merge logic. Stored outside STORAGE_KEY/members on purpose, so it is
+    // untouched by export/import and survives independently per browser.
+    const DEVICE_ID_KEY = 'family_health_tracker_device_id';
+    let _deviceId = null;
+    function getDeviceId() {
+      if (_deviceId) return _deviceId;
+      try {
+        let id = localStorage.getItem(DEVICE_ID_KEY);
+        if (!id) {
+          id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : freshId('dev');
+          localStorage.setItem(DEVICE_ID_KEY, id);
+        }
+        _deviceId = id;
+      } catch (e) {
+        // localStorage unavailable (private mode edge cases etc.) - fall
+        // back to an in-memory id for this session only. Provenance-only
+        // field, so a non-persistent fallback here is not a correctness risk.
+        _deviceId = freshId('dev');
+      }
+      return _deviceId;
+    }
+
+    // Scalar member fields tracked individually via member.fieldVersion, so
+    // two people editing different fields on the same member (e.g. A changes
+    // phone, B changes allergies) never conflict with or clobber each other.
+    // NOTE: keep this list in sync with the fields actually collected in
+    // saveMember()'s `fields` object - any field added there without being
+    // added here silently falls back to whole-member conflict granularity.
+    const MEMBER_SCALAR_FIELDS = [
+      'name', 'nameZh', 'nameZhAvatarIdx', 'gender', 'birth', 'blood',
+      'height', 'allergies', 'emergency', 'bloodTypeAttachment'
+    ];
+    // history is handled separately (id+version entry array, see design 1.10 / 2.1), not a plain scalar.
+
+    function freshFieldVersions() {
+      const fv = {};
+      MEMBER_SCALAR_FIELDS.forEach(f => { fv[f] = 1; });
+      return fv;
+    }
+
+    // Bumps the fieldVersion entry for exactly the scalar fields that
+    // actually changed between `before` and `after` (shallow compare via
+    // JSON.stringify - fine for these field types: strings/numbers/null and
+    // the small bloodTypeAttachment object). Also bumps entity.version once
+    // if anything changed, matching bumpVersion()'s semantics.
+    function bumpFieldVersions(member, before, after) {
+      if (!member.fieldVersion) member.fieldVersion = freshFieldVersions();
+      let changed = false;
+      MEMBER_SCALAR_FIELDS.forEach(f => {
+        if (JSON.stringify(before[f]) !== JSON.stringify(after[f])) {
+          member.fieldVersion[f] = (member.fieldVersion[f] || 1) + 1;
+          changed = true;
+        }
+      });
+      if (changed) bumpVersion(member);
+      return changed;
+    }
+
+    // Converts a plain history/notes string into the id+version entry-array
+    // shape (design 1.10). v1 UI still edits this as a single block, so in
+    // practice this array holds one entry that gets its version bumped on
+    // edit - but the shape is future-proof for a later "append a new entry"
+    // affordance without a text-migration headache.
+    function historyTextToEntries(text) {
+      const t = (text || '').trim();
+      if (!t) return [];
+      return [{ id: freshId('hx'), version: 1, text: t, deletedAt: null }];
+    }
+    // Reads the current effective history text back out of the entry array
+    // (v1: just the latest non-deleted entry's text) for anywhere the app
+    // still wants a plain string (rendering, reminders' `.includes(...)` check).
+    function historyEntriesToText(entries) {
+      if (!Array.isArray(entries)) return '';
+      const live = entries.filter(e => !e.deletedAt);
+      return live.length ? live[live.length - 1].text : '';
+    }
+
+    // Recursively backfills sync metadata onto every syncable entity in the
+    // existing (pre-merge-sync-feature) member data: called once at load
+    // time for both real user data and DEMO_DATA. Idempotent - entities that
+    // already have a `version` field are left untouched, so re-running this
+    // on already-migrated data (e.g. after a fresh import of an old-format
+    // single-member file) is always safe.
+    function migrateSyncFields(allMembers) {
+      if (!Array.isArray(allMembers)) return allMembers;
+
+      // Generic recursive stamp for any array of id-bearing entities nested
+      // under insurance (ledger rows, riders, coverages, sumInsuredHistory,
+      // surrender records, claims, ...). Attachments get the reduced
+      // id+deletedAt-only shape per design 1.9/2.2, not a full version stamp.
+      function stampArray(arr, { attachmentsOnly = false } = {}) {
+        if (!Array.isArray(arr)) return;
+        arr.forEach(item => {
+          if (!item || typeof item !== 'object') return;
+          if (attachmentsOnly) {
+            if (!('deletedAt' in item)) item.deletedAt = null;
+            return;
+          }
+          if (!Number.isFinite(item.version)) item.version = 1;
+          if (!('updatedAt' in item) || !item.updatedAt) item.updatedAt = nowIso();
+          if (!('deletedAt' in item)) item.deletedAt = null;
+          if (!Number.isFinite(item.schemaVersion)) item.schemaVersion = SYNC_SCHEMA_VERSION;
+        });
+      }
+
+      function stampPolicy(p) {
+        if (!p || typeof p !== 'object') return;
+        if (!Number.isFinite(p.version)) p.version = 1;
+        if (!('updatedAt' in p) || !p.updatedAt) p.updatedAt = nowIso();
+        if (!('deletedAt' in p)) p.deletedAt = null;
+        if (!Number.isFinite(p.schemaVersion)) p.schemaVersion = SYNC_SCHEMA_VERSION;
+        stampArray(p.ledger);
+        stampArray(p.riders);
+        stampArray(p.coverages);
+        (p.coverages || []).forEach(c => stampArray(c.sumInsuredHistory));
+        stampArray(p.surrenderRecords);
+        stampArray(p.claims);
+        stampArray(p.attachments, { attachmentsOnly: true });
+        (p.ledger || []).forEach(l => stampArray(l.attachments, { attachmentsOnly: true }));
+      }
+
+      allMembers.forEach(m => {
+        if (!m || typeof m !== 'object') return;
+
+        if (!Number.isFinite(m.version)) m.version = 1;
+        if (!('updatedAt' in m) || !m.updatedAt) m.updatedAt = nowIso();
+        if (!('deletedAt' in m)) m.deletedAt = null;
+        if (!Number.isFinite(m.schemaVersion)) m.schemaVersion = SYNC_SCHEMA_VERSION;
+        if (!m.fieldVersion) m.fieldVersion = freshFieldVersions();
+
+        // history: add the id+version entry-array shadow alongside the
+        // existing m.history string, WITHOUT touching m.history itself yet.
+        // Every current render/read site in the app (BP reminder check,
+        // print views, the edit form, etc.) still reads m.history as a
+        // plain string - rewiring all of those to read through
+        // historyEntriesToText()/write through historyTextToEntries() is
+        // deliberately left for the merge-wiring step (build order step 4),
+        // not bundled into this data-layer pass. Until that wiring lands,
+        // historyEntries exists but is not yet the source of truth -
+        // m.history remains authoritative.
+        if (!Array.isArray(m.historyEntries)) {
+          m.historyEntries = historyTextToEntries(m.history);
+        }
+
+        stampArray(m.records);
+        (m.records || []).forEach(r => stampArray(r.attachments, { attachmentsOnly: true }));
+        stampArray(m.customReminders);
+        if (m.bloodTypeAttachment && typeof m.bloodTypeAttachment === 'object' && !('deletedAt' in m.bloodTypeAttachment)) {
+          m.bloodTypeAttachment.deletedAt = null;
+        }
+
+        if (m.insurance && Array.isArray(m.insurance.policies)) {
+          m.insurance.policies.forEach(stampPolicy);
+        }
+      });
+
+      return allMembers;
+    }
+
     // Returns a NEW array of records sorted by date descending (newest first).
     // Never mutates m.records, so "latest" values stay consistent no matter
     // which tabs the user has viewed.
@@ -271,6 +480,27 @@
     function isEncryptionEnabled() { const cfg = getCryptoConfig(); return !!(cfg && cfg.enabled); }
     function isUnlocked() { return !!cryptoKey; }
 
+    // Independent record of the user's last DELIBERATE encryption choice on
+    // this device, separate from CRYPTO_CONFIG_KEY itself. Only ever written
+    // in exactly two places: right after cryptoSetup() succeeds ('enabled'),
+    // and right after the confirm()-gated "Disable Encryption" Settings
+    // action completes ('disabled'). No other code path touches this key -
+    // not import, not the PBKDF2 migration, not any error handler.
+    //
+    // Why this exists: init() decides whether to show the lock screen using
+    // ONLY getCryptoConfig().enabled. If that ever comes back empty/false
+    // for a reason OTHER than the deliberate disable flow above (a browser
+    // storage anomaly, a future bug, anything) - init() would currently fall
+    // straight through to initAppData() and render whatever's in
+    // localStorage with no passcode prompt at all, since that's exactly what
+    // "encryption is off" is supposed to look like. This sentinel lets init()
+    // tell the difference between "encryption was intentionally turned off"
+    // and "encryption config vanished unexpectedly" and warn loudly in the
+    // second case instead of silently proceeding either way.
+    const CRYPTO_INTENT_KEY = 'family_health_tracker_v3_crypto_intent';
+    function setCryptoIntent(state) { try { localStorage.setItem(CRYPTO_INTENT_KEY, state); } catch {} }
+    function getCryptoIntent() { try { return localStorage.getItem(CRYPTO_INTENT_KEY); } catch { return null; } }
+
     function bufToB64(buf) {
       // Chunked conversion - converting large buffers (e.g. an encrypted photo)
       // one character at a time via string concatenation is catastrophically
@@ -340,6 +570,7 @@
       const key = await deriveKeyFromPasscode(passcode, saltB64); // always uses PBKDF2_CONFIGS[PBKDF2_ITER_VERSION] - a brand-new setup has no legacy config to preserve
       const verifier = await encryptText('verify-ok', key);
       setCryptoConfig({ enabled: true, salt: saltB64, verifier, iterVer: PBKDF2_ITER_VERSION });
+      setCryptoIntent('enabled');
       cryptoKey = key;
     }
 
@@ -595,7 +826,13 @@
     async function enrollBiometric(passcode) {
       const cfg = getCryptoConfig();
       if (!cfg || !cfg.enabled) throw new Error('Enable encryption first.');
-      const testKey = await deriveKeyFromPasscode(passcode, cfg.salt);
+      // Must derive with whatever iteration count this vault's key actually
+      // uses right now (cfg.iterVer, defaulting to legacy version 1) - same
+      // reasoning as cryptoUnlock() and the import fix above. Defaulting to
+      // the current/highest count here would silently produce the wrong key
+      // and reject a correct passcode on any vault that hasn't been through
+      // migratePbkdf2Iterations() yet.
+      const testKey = await deriveKeyFromPasscode(passcode, cfg.salt, PBKDF2_CONFIGS[cfg.iterVer || 1]);
       let check;
       try { check = await decryptText(cfg.verifier, testKey); } catch { check = null; }
       if (check !== 'verify-ok') throw new Error('Incorrect passcode.');
@@ -718,6 +955,7 @@
           (m.insurance.policies || []).forEach(p => {
             (p.attachments || []).forEach(a => { if (a.id) ids.push(a.id); });
             (p.ledger || []).forEach(l => (l.attachments || []).forEach(a => { if (a.id) ids.push(a.id); }));
+            (p.surrenderRecords || []).forEach(r => (r.attachments || []).forEach(a => { if (a.id) ids.push(a.id); }));
           });
         }
       });
@@ -783,6 +1021,7 @@
         document.getElementById('unlockPasscodeInput').value = '';
         document.getElementById('unlockError').textContent = '';
         document.getElementById('unlockModal').classList.add('active');
+        if (resetUnlockNumpad) resetUnlockNumpad();
         setTimeout(() => document.getElementById('unlockPasscodeInput').focus(), 50);
         updateUnlockModalBioUI();
       });
@@ -960,16 +1199,103 @@
       }
     }
 
+    // ========== ON-SCREEN NUMPAD (app lock screen + attachment unlock modal) ==========
+    // Wires a big touch-friendly numpad to a passcode <input>, for mobile/tablet
+    // users who'd otherwise have to fight the OS's cramped default keyboard.
+    // The input keeps inputmode="none" (set in the HTML) so tapping it directly
+    // does not pop up the on-screen keyboard; numpad buttons only ever write to
+    // input.value, never call .focus(), so the keyboard stays down on mobile
+    // regardless. Passcodes aren't restricted to digits (see secPasscode
+    // validation - just "at least 6 characters"), so a small ⌨️ toggle switches
+    // the field back to normal free-text keyboard entry for anyone whose
+    // passcode has letters/symbols in it, and back again.
+    function wirePasscodeNumpad(inputId, numpadId, toggleId, backspaceId) {
+      const input = document.getElementById(inputId);
+      const numpad = document.getElementById(numpadId);
+      const toggleBtn = document.getElementById(toggleId);
+      const backspaceBtn = document.getElementById(backspaceId);
+      if (!input || !numpad || !toggleBtn || !backspaceBtn) return;
+
+      let keyboardMode = false;
+
+      function appendChar(ch) {
+        input.value += ch;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      function backspace() {
+        input.value = input.value.slice(0, -1);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      function setKeyboardMode(on) {
+        keyboardMode = on;
+        if (on) {
+          input.removeAttribute('inputmode');
+          numpad.classList.add('s-hidden');
+          toggleBtn.textContent = '🔢';
+          toggleBtn.title = 'Switch back to number pad';
+          input.focus();
+        } else {
+          input.setAttribute('inputmode', 'none');
+          numpad.classList.remove('s-hidden');
+          toggleBtn.textContent = '⌨️';
+          toggleBtn.title = 'Passcode has letters? Switch to keyboard';
+        }
+      }
+
+      numpad.querySelectorAll('[data-numpad-digit]').forEach((btn) => {
+        btn.addEventListener('click', () => appendChar(btn.getAttribute('data-numpad-digit')));
+      });
+      backspaceBtn.addEventListener('click', backspace);
+      toggleBtn.addEventListener('click', () => setKeyboardMode(!keyboardMode));
+
+      // Reset to numpad mode whenever the screen/modal holding this input is
+      // (re)shown, so a previous keyboard-mode choice doesn't leak into the
+      // next unlock attempt.
+      return () => setKeyboardMode(false);
+    }
+
+    const resetAppLockNumpad = wirePasscodeNumpad(
+      'appLockPasscodeInput', 'appLockNumpad', 'appLockNumpadToggle', 'appLockNumpadBackspace'
+    );
+    const resetUnlockNumpad = wirePasscodeNumpad(
+      'unlockPasscodeInput', 'unlockNumpad', 'unlockNumpadToggle', 'unlockNumpadBackspace'
+    );
+
     // ========== INIT ==========
     let membersLoaded = false;
 
     function init() {
       const cfg = getCryptoConfig();
       if (cfg && cfg.enabled) {
+        // Backfill for devices that enabled encryption before this sentinel
+        // existed - from this point on their intent is correctly tracked too.
+        if (getCryptoIntent() !== 'enabled') setCryptoIntent('enabled');
         // Data is encrypted at rest - block the whole app until the passcode is verified.
         document.getElementById('appLockScreen').style.display = 'flex';
+        if (resetAppLockNumpad) resetAppLockNumpad();
         setTimeout(() => document.getElementById('appLockPasscodeInput').focus(), 50);
         updateAppLockBioUI();
+      } else if (getCryptoIntent() === 'enabled') {
+        // Encryption's own config is missing/disabled, but the last
+        // DELIBERATE choice recorded on this device was "enabled," and
+        // that record is only ever changed by the confirm()-gated Disable
+        // Encryption action (which would have set it to 'disabled'). This
+        // combination should be impossible through normal use - warn
+        // loudly rather than silently rendering whatever's in localStorage
+        // (which, with encryption off, is plaintext) with no passcode
+        // prompt at all. Still proceed afterward rather than hard-locking
+        // the person out with no path forward - see the comment on
+        // CRYPTO_INTENT_KEY above for the reasoning.
+        alert(
+          '⚠️ Encryption settings could not be found on this device, even ' +
+          'though encryption was previously turned on here. Your data may ' +
+          'now be loading unencrypted.\n\n' +
+          'This should not happen during normal use. If you did not ' +
+          'deliberately disable encryption in Settings, please check ' +
+          'Settings → Security once the app loads, and consider restoring ' +
+          'from a recent backup to be safe.'
+        );
+        initAppData();
       } else {
         initAppData();
       }
@@ -1035,6 +1361,7 @@
     function relockApp() {
       cryptoLock();
       document.getElementById('appLockScreen').style.display = 'flex';
+      if (resetAppLockNumpad) resetAppLockNumpad();
       setTimeout(() => document.getElementById('appLockPasscodeInput').focus(), 50);
       updateAppLockBioUI();
     }
@@ -1050,6 +1377,7 @@
           const jsonStr = await decryptText(saved, cryptoKey);
           const parsed = JSON.parse(jsonStr);
           members = (Array.isArray(parsed) && parsed.length > 0) ? parsed : [];
+          migrateSyncFields(members);
         } catch (e) {
           alert('⚠️ Your data could not be decrypted even though the passcode was accepted. ' +
                 'To avoid data loss, the app will not load or overwrite anything. ' +
@@ -1063,17 +1391,21 @@
           const parsed = JSON.parse(saved);
           if (Array.isArray(parsed) && parsed.length > 0) {
             members = parsed;
+            migrateSyncFields(members);
           } else {
             members = JSON.parse(JSON.stringify(DEMO_DATA));
+            migrateSyncFields(members);
             saveData();
           }
         } catch(e) {
           members = JSON.parse(JSON.stringify(DEMO_DATA));
+          migrateSyncFields(members);
           saveData();
         }
       } else {
         // First time - load demo data
         members = JSON.parse(JSON.stringify(DEMO_DATA));
+        migrateSyncFields(members);
         saveData();
       }
 
@@ -2073,8 +2405,17 @@
       if (!m.customReminders) m.customReminders = [];
       const previousReminders = [...m.customReminders];
       const idx = m.customReminders.findIndex(x => x.id === reminder.id);
-      if (idx > -1) m.customReminders[idx] = reminder;
-      else m.customReminders.push(reminder);
+      if (idx > -1) {
+        const prior = m.customReminders[idx];
+        reminder.version = prior.version;
+        reminder.deletedAt = prior.deletedAt;
+        reminder.schemaVersion = prior.schemaVersion || SYNC_SCHEMA_VERSION;
+        bumpVersion(reminder);
+        m.customReminders[idx] = reminder;
+      } else {
+        Object.assign(reminder, freshSyncMeta());
+        m.customReminders.push(reminder);
+      }
 
       if (!saveData()) { m.customReminders = previousReminders; return; }
       closeReminderModal();
@@ -2103,6 +2444,7 @@
         const next = new Date();
         next.setMonth(next.getMonth() + cr.repeatMonths);
         cr.dueDate = next.toISOString().slice(0, 10);
+        bumpVersion(cr);
       } else {
         m.customReminders = m.customReminders.filter(x => x.id !== id);
       }
@@ -2238,14 +2580,16 @@
         const m = members.find(x => x.id === editingMemberId);
         if (!m) return;
         const oldAttId = m.bloodTypeAttachment?.id;
+        const before = {}; MEMBER_SCALAR_FIELDS.forEach(f => { before[f] = m[f]; });
         Object.assign(m, fields);
+        bumpFieldVersions(m, before, fields); // per-field version bump, see design 2.1
         if (!saveData()) return; // keep modal open so nothing is lost if storage failed
         if (oldAttId && oldAttId !== fields.bloodTypeAttachment?.id) idbDelete(oldAttId);
         renderMemberList();
         closeModal('member');
         renderMain();
       } else {
-        const member = { id: Date.now().toString(), ...fields, records: [] };
+        const member = { id: Date.now().toString(), ...fields, records: [], ...freshSyncMeta(), fieldVersion: freshFieldVersions(), historyEntries: historyTextToEntries(fields.history) };
         members.push(member);
         if (!saveData()) { members.pop(); return; }
         renderMemberList();
@@ -2293,8 +2637,16 @@
       const oldAttachmentIds = existingIdx > -1 ? (m.records[existingIdx].attachments || []).map(a => a.id).filter(Boolean) : [];
 
       if (existingIdx > -1) {
+        // Preserve sync metadata identity across an edit: bump version,
+        // don't reset it to 1, and don't touch deletedAt/schemaVersion.
+        const prior = m.records[existingIdx];
+        record.version = prior.version;
+        record.deletedAt = prior.deletedAt;
+        record.schemaVersion = prior.schemaVersion || SYNC_SCHEMA_VERSION;
+        bumpVersion(record);
         m.records[existingIdx] = record;
       } else {
+        Object.assign(record, freshSyncMeta());
         m.records.push(record);
       }
 
@@ -3095,10 +3447,17 @@
 
       let exportKey = null;
       let exportSalt = null;
+      let exportIterVer = null;
       if (encrypt) {
         if (appReady) {
           exportKey = cryptoKey;
-          exportSalt = getCryptoConfig().salt;
+          const cfg = getCryptoConfig();
+          exportSalt = cfg.salt;
+          // Whatever iteration count actually produced cryptoKey right now -
+          // could still be the legacy count if this vault hasn't gone
+          // through migratePbkdf2Iterations() yet. Must match exactly, or
+          // import will derive the wrong key from this file.
+          exportIterVer = cfg.iterVer || 1;
         } else {
           const p1 = document.getElementById('exportPasscode1').value;
           const p2 = document.getElementById('exportPasscode2').value;
@@ -3106,15 +3465,16 @@
           if (p1 !== p2) { errEl.textContent = 'Passcodes do not match.'; return; }
           const saltBytes = crypto.getRandomValues(new Uint8Array(16));
           exportSalt = bufToB64(saltBytes);
-          exportKey = await deriveKeyFromPasscode(p1, exportSalt);
+          exportIterVer = PBKDF2_ITER_VERSION; // fresh salt each export -> always safe to use the current/strongest count
+          exportKey = await deriveKeyFromPasscode(p1, exportSalt, PBKDF2_CONFIGS[exportIterVer]);
         }
       }
 
       document.getElementById('exportOptionsModal').classList.remove('active');
       try {
-        if (pendingExportType === 'all') await exportData(encrypt, exportKey, exportSalt);
-        else if (pendingExportType === 'member') await exportMember(encrypt, exportKey, exportSalt);
-        else if (pendingExportType === 'zip') await packZip(encrypt, exportKey, exportSalt);
+        if (pendingExportType === 'all') await exportData(encrypt, exportKey, exportSalt, exportIterVer);
+        else if (pendingExportType === 'member') await exportMember(encrypt, exportKey, exportSalt, exportIterVer);
+        else if (pendingExportType === 'zip') await packZip(encrypt, exportKey, exportSalt, exportIterVer);
       } catch (err) {
         alert('Export failed: ' + err.message);
       }
@@ -3123,21 +3483,35 @@
     // Wraps JSON text in a self-describing encrypted envelope (carries its own
     // salt, so the file can be decrypted on ANY device given the right
     // passcode - it isn't tied to this device's own Security setup).
-    async function buildExportPayload(jsonString, encrypt, key, salt) {
+    // iterVer records which PBKDF2_CONFIGS entry the key was derived with, so
+    // a future import (possibly after PBKDF2_ITER_VERSION has been bumped
+    // again) still derives the SAME key this file was actually encrypted
+    // with, instead of silently trying the current/default iteration count
+    // and failing with what looks like "wrong passcode."
+    async function buildExportPayload(jsonString, encrypt, key, salt, iterVer) {
       if (!encrypt) return jsonString;
       const payload = await encryptText(jsonString, key);
-      return JSON.stringify({ encryptedBackup: true, version: 1, salt, payload });
+      return JSON.stringify({ encryptedBackup: true, version: 1, salt, iterVer, payload });
     }
 
 
-    async function exportMember(encrypt, key, salt) {
+    // Wraps an inflated member array with a marker saying whether this file is a
+    // full-family backup ('all') or a single-member export ('member'). Import
+    // uses this to decide whether it's safe to merge just one member's data in
+    // (member exports) or whether the whole family must be replaced (backups).
+    function buildExportEnvelope(inflatedMembers, exportType) {
+      return { fhsExportType: exportType, exportedAt: new Date().toISOString(), members: inflatedMembers };
+    }
+
+    async function exportMember(encrypt, key, salt, iterVer) {
       if (!currentMemberId) {
         alert('Please select a member first');
         return;
       }
       const m = members.find(x => x.id === currentMemberId);
       const inflated = await inflateMembersForExport([m]);
-      const data = await buildExportPayload(JSON.stringify(inflated, null, 2), encrypt, key, salt);
+      const envelope = buildExportEnvelope(inflated, 'member');
+      const data = await buildExportPayload(JSON.stringify(envelope, null, 2), encrypt, key, salt, iterVer);
       const blob = new Blob([data], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -3147,9 +3521,10 @@
       URL.revokeObjectURL(url);
     }
 
-    async function exportData(encrypt, key, salt) {
+    async function exportData(encrypt, key, salt, iterVer) {
       const inflated = await inflateMembersForExport(members);
-      const data = await buildExportPayload(JSON.stringify(inflated, null, 2), encrypt, key, salt);
+      const envelope = buildExportEnvelope(inflated, 'all');
+      const data = await buildExportPayload(JSON.stringify(envelope, null, 2), encrypt, key, salt, iterVer);
       const blob = new Blob([data], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -3157,6 +3532,22 @@
       a.download = `FamilyHealthShield_Backup_${localDateStr()}${encrypt ? '_encrypted' : ''}.json`;
       a.click();
       URL.revokeObjectURL(url);
+    }
+
+    // Unwraps an imported file into { exportType, rawMembers }. New exports carry
+    // an explicit fhsExportType ('member' or 'all'); older exports made before
+    // this distinction existed are a bare array with no envelope, and are always
+    // treated as 'all' so their import behavior is unchanged (full replace) -
+    // there's no reliable way to tell an old single-member export from an old
+    // full backup of a one-person family, so we don't guess.
+    function parseImportEnvelope(parsed) {
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.members)) {
+        return { exportType: parsed.fhsExportType === 'member' ? 'member' : 'all', rawMembers: parsed.members };
+      }
+      if (Array.isArray(parsed)) {
+        return { exportType: 'all', rawMembers: parsed };
+      }
+      throw new Error('Expected a JSON array of family members, or a Family Health Shield export file.');
     }
 
     // Validates and normalizes imported data so a malformed or foreign JSON
@@ -3236,6 +3627,37 @@
       return memberList;
     }
 
+    // Merges a single-member export into the existing family, matched by id -
+    // unlike a full backup import, this never replaces the whole `members`
+    // array, so every OTHER family member is left completely untouched. A
+    // matching id updates that member in place; no match (e.g. re-importing
+    // onto a fresh device, or someone renamed/lost their original) offers to
+    // add them as a new member instead of silently discarding the file.
+    async function mergeImportedMembers(normalized) {
+      for (const incoming of normalized) {
+        const idx = members.findIndex(x => x.id === incoming.id);
+        const isUpdate = idx !== -1;
+        const label = isUpdate
+          ? `Update "${incoming.name}" using this file?\n\nThis replaces that member's own records, insurance, etc. with the imported version. Other family members are not affected.`
+          : `"${incoming.name}" doesn't match any current family member.\n\nAdd them as a new member from this file?`;
+        if (!confirm(label)) continue;
+        const previousMembers = members;
+        const [migrated] = await migrateMemberAttachmentsToIdb([incoming]);
+        const nextMembers = [...members];
+        if (isUpdate) nextMembers[idx] = migrated; else nextMembers.push(migrated);
+        members = nextMembers;
+        if (!saveData()) {
+          members = previousMembers;
+          alert(`Couldn't save the imported data for "${incoming.name}" - storage may be full.`);
+          continue;
+        }
+        currentMemberId = migrated.id;
+        currentTab = 'overview';
+      }
+      renderMemberList();
+      renderMain();
+    }
+
     async function extractJsonFromZip(file) {
       if (typeof JSZip === 'undefined') {
         throw new Error('ZIP support (JSZip) failed to load - check your connection and try again, or extract the ZIP manually and import the .json file inside.');
@@ -3278,16 +3700,28 @@
           }
         }
 
-        let normalized;
+        let envelope;
         try {
-          normalized = normalizeImportedMembers(parsed);
+          envelope = parseImportEnvelope(parsed);
         } catch(err) {
           alert('Invalid file format: ' + err.message);
           e.target.value = '';
           return;
         }
 
-        if (confirm(`Import will replace current ${members.length} members with ${normalized.length} imported member(s). Continue?`)) {
+        let normalized;
+        try {
+          normalized = normalizeImportedMembers(envelope.rawMembers);
+        } catch(err) {
+          alert('Invalid file format: ' + err.message);
+          e.target.value = '';
+          return;
+        }
+
+        if (envelope.exportType === 'member') {
+          // Single-member export: merge in by id, touching only that member.
+          await mergeImportedMembers(normalized);
+        } else if (confirm(`Import will replace current ${members.length} members with ${normalized.length} imported member(s). Continue?`)) {
           const previousMembers = members;
           normalized = await migrateMemberAttachmentsToIdb(normalized);
           members = normalized;
@@ -3331,7 +3765,15 @@
       const pass = document.getElementById('importPasscodeInput').value;
       const { envelope, resolve } = importPasscodeResolver;
       try {
-        const key = await deriveKeyFromPasscode(pass, envelope.salt);
+        // Files exported before this fix (or by the version of the app that
+        // was live before this deploy) have no iterVer field at all - treat
+        // those as version 1 (this app's original hardcoded 150,000), same
+        // convention as cfg.iterVer for the main vault. Using the WRONG
+        // iteration count here derives a completely different key from the
+        // correct passcode and decryption fails - indistinguishable from an
+        // actually-wrong passcode, which is exactly the bug this fixes.
+        const iterVer = envelope.iterVer || 1;
+        const key = await deriveKeyFromPasscode(pass, envelope.salt, PBKDF2_CONFIGS[iterVer]);
         const decrypted = await decryptText(envelope.payload, key);
         document.getElementById('importPasscodeModal').classList.remove('active');
         importPasscodeResolver = null;
@@ -3349,7 +3791,7 @@
     });
 
     // ========== PACK ZIP ==========
-    async function packZip(encrypt, key, salt) {
+    async function packZip(encrypt, key, salt, iterVer) {
       if (typeof JSZip === 'undefined') {
         alert('JSZip library failed to load. Check internet connection.');
         return;
@@ -3361,7 +3803,8 @@
       zip.file('family_health_and_shield.html', htmlContent);
 
       const inflated = await inflateMembersForExport(members);
-      const backupJson = await buildExportPayload(JSON.stringify(inflated, null, 2), encrypt, key, salt);
+      const envelope = buildExportEnvelope(inflated, 'all');
+      const backupJson = await buildExportPayload(JSON.stringify(envelope, null, 2), encrypt, key, salt, iterVer);
       zip.file(`backup/family_health_backup${encrypt ? '_encrypted' : ''}.json`, backupJson);
 
       zip.folder('attachments');
@@ -3456,6 +3899,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     let insTempCoverages = [];
     let insTempAttachments = [];
     let insTempLedgerAttachments = [];
+    let insTempSurrenderAttachments = [];
     let insCurrentLedgerPolicyId = null;
     let insCurrentSurrenderPolicyId = null;
     let insCurrentSumHistoryPolicyId = null;
@@ -4371,6 +4815,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       document.getElementById('insSNonGuaranteed').value = '';
       document.getElementById('insBtnAddSurrenderEntry').textContent = '+ Add Statement Record';
       document.getElementById('insBtnCancelSurrenderEdit').style.display = 'none';
+      insTempSurrenderAttachments = [];
+      insRenderSurrenderAttachmentPreview();
     }
     function insRenderSurrenderList(p) {
       const currentEl = document.getElementById('insSurrenderCurrent');
@@ -4396,8 +4842,14 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
           <div class="s-ebc463b1">
             Bonus ${insFmtMoney(r.accumulatedBonus)} · Investment Fund Value ${insFmtMoney(r.dividend)} · Guaranteed ${insFmtMoney(r.guaranteedCashValue)} · Non-Guaranteed ${insFmtMoney(r.nonGuaranteedValue)}
           </div>
+          ${(r.attachments && r.attachments.length) ? `<div class="s-bb680ec5">${r.attachments.map((att, idx) => `<span data-ins-open-surrender-att="${escapeHtml(r.id)}" data-ins-att-idx="${idx}" class="s-cd942964">${att.type === 'image' ? '🖼️' : '📄'} ${escapeHtml(att.name)}</span>`).join('')}</div>` : ''}
         </div>
       `).join('');
+      container.querySelectorAll('[data-ins-open-surrender-att]').forEach(el => el.addEventListener('click', () => {
+        const r = p.surrenderRecords.find(x => x.id === el.dataset.insOpenSurrenderAtt);
+        const att = r && r.attachments ? r.attachments[parseInt(el.dataset.insAttIdx)] : null;
+        openAttachment(att);
+      }));
       container.querySelectorAll('[data-ins-edit-surrender]').forEach(el => el.addEventListener('click', () => {
         const r = p.surrenderRecords.find(x => x.id === el.dataset.insEditSurrender);
         if (!r) return;
@@ -4410,6 +4862,9 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         document.getElementById('insSNonGuaranteed').value = r.nonGuaranteedValue ?? '';
         document.getElementById('insBtnAddSurrenderEntry').textContent = 'Update Statement Record';
         document.getElementById('insBtnCancelSurrenderEdit').style.display = 'inline-block';
+        insTempSurrenderAttachments = r.attachments ? r.attachments.map(a => ({ ...a })) : [];
+        insRenderSurrenderAttachmentPreview();
+        document.getElementById('insSurrenderFormTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
       }));
       container.querySelectorAll('[data-ins-remove-surrender]').forEach(el => el.addEventListener('click', () => {
         if (!confirm('Delete this statement record? This cannot be undone.')) return;
@@ -4421,9 +4876,10 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         insRenderSurrenderList(p); renderMain();
       }));
     }
-    document.getElementById('insBtnAddSurrenderEntry').addEventListener('click', () => {
+    document.getElementById('insBtnAddSurrenderEntry').addEventListener('click', async () => {
       const date = document.getElementById('insSDate').value;
       if (!date) { alert('Please enter the statement date'); return; }
+      if (!(await ensureUnlocked())) return;
       const m = members.find(x => x.id === currentMemberId);
       const p = m.insurance.policies.find(x => x.id === insCurrentSurrenderPolicyId);
       if (!p.surrenderRecords) p.surrenderRecords = [];
@@ -4432,7 +4888,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         accumulatedBonus: document.getElementById('insSBonus').value,
         dividend: document.getElementById('insSDividend').value,
         guaranteedCashValue: document.getElementById('insSGuaranteed').value,
-        nonGuaranteedValue: document.getElementById('insSNonGuaranteed').value
+        nonGuaranteedValue: document.getElementById('insSNonGuaranteed').value,
+        attachments: await persistAttachmentsToIdb(insTempSurrenderAttachments)
       };
       if (insEditingSurrenderId) {
         const r = p.surrenderRecords.find(x => x.id === insEditingSurrenderId);
@@ -4446,6 +4903,47 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     });
     document.getElementById('insBtnCancelSurrenderEdit').addEventListener('click', insResetSurrenderForm);
     document.getElementById('insBtnCloseSurrender').addEventListener('click', () => document.getElementById('insSurrenderModal').classList.remove('active'));
+
+    // Statement record attachments (statement / proof documents)
+    document.getElementById('insSFileDropArea').addEventListener('click', async () => { if (await ensureUnlocked()) document.getElementById('insSAttachments').click(); });
+    document.getElementById('insSAttachments').addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files);
+      for (const file of files) {
+        const isImage = file.type.startsWith('image/');
+        const isPdf = file.type === 'application/pdf';
+        if (!isImage && !isPdf) continue;
+        const data = isImage ? await readImageResized(file) : await readFileAsDataUrl(file);
+        if (!data) { alert(`Couldn't read "${file.name}" - it wasn't added.`); continue; }
+        const thumb = isImage ? await readImageThumb(file) : null;
+        insTempSurrenderAttachments.push({ name: file.name, path: `${ATTACHMENTS_FOLDER}/surrender/${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}`, type: isImage ? 'image' : 'pdf', data, thumb, size: data.length });
+        insRenderSurrenderAttachmentPreview();
+      }
+      e.target.value = '';
+    });
+    function insRenderSurrenderAttachmentPreview() {
+      const preview = document.getElementById('insSAttachmentPreview');
+      preview.innerHTML = insTempSurrenderAttachments.map((att, idx) => {
+        const previewSrc = att.thumb || att.data;
+        return `
+        <div class="attachment-item">
+          <div class="attachment-thumb">
+            ${att.type === 'image' && previewSrc ? `<img src="${previewSrc}" alt="">` : `<span>${att.type === 'image' ? '🖼️' : '📄'}</span>`}
+          </div>
+          <div class="attachment-info">
+            <div class="attachment-name">${escapeHtml(att.name)}</div>
+            <div class="attachment-path">${att.size ? formatBytes(att.size) : ''}</div>
+          </div>
+          <span class="attachment-remove" data-idx="${idx}">Remove</span>
+        </div>
+      `;
+      }).join('');
+      preview.querySelectorAll('.attachment-remove').forEach(btn => {
+        btn.addEventListener('click', function() {
+          insTempSurrenderAttachments.splice(parseInt(this.dataset.idx), 1);
+          insRenderSurrenderAttachmentPreview();
+        });
+      });
+    }
 
     // ===== Sum Insured History modal (Reducing Term) =====
     let insEditingSumHistoryId = null;
@@ -4817,6 +5315,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       if (!(await ensureUnlocked())) return;
       await reencryptAllAttachments(false);
       localStorage.removeItem(CRYPTO_CONFIG_KEY);
+      setCryptoIntent('disabled');
       await clearBioConfig(); // biometric unlock is meaningless without a passcode-derived key behind it
       cryptoLock();
       saveData(); // re-writes the main health + insurance data blob as plaintext
