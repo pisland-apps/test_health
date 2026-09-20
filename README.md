@@ -139,3 +139,9 @@ const CACHE_VERSION = 'v1';
   **全量导出("Export All")的行为不变**,依然是整份覆盖,这次改动只影响"导出单个成员"这一条路径,详见 `MERGE_SYNC_DESIGN.md` 里的范围说明。
 
   这次改动新增了两个文件(`merge-engine.js`、`merge-engine.test.js`),`service-worker.js` 的预缓存列表(`APP_SHELL`)已加入 `merge-engine.js`,`index.html` 已在 `app.js` 之前加上对应的 `<script>` 标签。没有改 `<style>` 块,不需要重新生成 CSP 哈希。`APP_VERSION`/`APP_VERSION_DATE`(app.js)和 `CACHE_VERSION`(service-worker.js)已同步改成 v39。
+- v40(2026-09-19)修复导出/重新导入同一份未改动的文件时,"血型检测报告"这个字段会被误判成冲突的问题。原因:这个字段走的是逐字段比较(`deepEqual`),但导出的文件里这个附件永远带着完整的图片/PDF 原始数据(`.data`,方便脱机携带),而本机存的那份从来不带 `.data`(已经存进 IndexedDB,主数据里只留 id/name/path 等元信息)——所以哪怕内容完全一样,一比较"本机的瘦身版"跟"刚导入的带 `.data` 胖版",永远判定"不一样"。修了 `merge-engine.js` 里专门给这个字段用的比较逻辑,比较前先把两边的 `.data` 都去掉,但被选中保留的那份仍然带着完整数据,不影响功能。`merge-engine.test.js` 补了 3 条回归测试(现在共 70 条,全部通过)。`APP_VERSION`/`CACHE_VERSION` 已同步改成 v40。
+- v41(2026-09-20)"🚨 Emergency Card"这一个打印报告,从"另开一个浏览器分页/弹窗打印"改成跟 Ledger 那边一样,直接在本页面内触发浏览器原生打印(`window.print()`),不再跳出新分页。其余 8 个打印报告(Health Summary、疫苗记录、用药清单、检验报告、血压/体重趋势、年度报告、保单/结单报告)这次没有动,还是原来的弹窗方式——用户确认这个改法感觉对了之后再一起改。
+
+  **实现方式**:新增一个平时隐藏的 `#printContainer`(`display:none`),只在 `@media print` 时显示,同时把页面上其它所有元素都强制隐藏,这样打印出来的只有报告本身。`printEmergency()` 不再 `document.write` 到一个新窗口,改成把报告 HTML 写进这个容器,再直接调用 `window.print()`。
+
+  **CSP 相关的两个坑,踩过了记录一下**:①原来的弹窗报告因为是完全独立的文档,给自己单独开了一个宽松的 CSP(`style-src 'unsafe-inline'`、`object-src data:`),跟主 App 的 CSP 没关系;改成页面内打印之后,报告内容现在要遵守主 App 更严格的 CSP,所以报告里不能再用内联 `<style>` 或 `style="..."` 属性(哪怕 `<style>` 块本身有哈希,单独的 `style="..."` 属性也不受那个哈希覆盖,除非 CSP 里另外声明 `'unsafe-hashes'`,这份 CSP 没有——写了才发现这个细节,一开始差点漏了两处内联 style,已经全部改成 class)。②原来血型报告里的 PDF 用 `<embed>` 展示,但主 CSP 是 `object-src 'none'`,`<embed>` 会被直接拦掉;改成复用附件预览已经在用的 pdf.js 方案,把 PDF 每一页画成 `<canvas>`,不依赖 `object-src`。这次改了 `<style>` 块,已经跑过 `regen-style-hash.py` 重新生成哈希,`index.html` 和 `_headers` 两处都已同步改成新哈希。`APP_VERSION`/`CACHE_VERSION` 已同步改成 v41。
