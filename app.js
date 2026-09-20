@@ -7,8 +7,8 @@
     // Service Worker and has no effect on caching. It does NOT auto-sync with
     // CACHE_VERSION in service-worker.js since they live in different files — bump both
     // together on every deploy. (Reminder comment also left in service-worker.js.)
-    const APP_VERSION = 'v41';
-    const APP_VERSION_DATE = '2026-09-20';
+    const APP_VERSION = 'v29';
+    const APP_VERSION_DATE = '2026-09-07';
     // Populate the badge immediately — app.js is loaded at the end of <body>, so the DOM
     // (including #versionBadge) already exists by the time this line runs. Deliberately
     // done at top level, not inside init()/initAppData(), so it renders before any
@@ -179,307 +179,11 @@
       return value;
     }
 
-    // Deep-clones a value (structuredClone where available, JSON round-trip
-    // fallback) and THEN runs sanitizeIdsDeep on the clone. Deliberately
-    // separate from sanitizeIdsDeep itself: that function mutates its input
-    // in place and returns the same reference, which is fine for its one
-    // existing caller (a disposable just-parsed import blob) but wrong for
-    // "keep both" merge-conflict resolutions, which need an INDEPENDENT
-    // copy with new ids - reusing sanitizeIdsDeep directly there would
-    // remap the ORIGINAL entity's ids instead of producing a duplicate.
-    function deepCloneAndRemapIds(value) {
-      const clone = (typeof structuredClone === 'function')
-        ? structuredClone(value)
-        : JSON.parse(JSON.stringify(value));
-      return sanitizeIdsDeep(clone);
-    }
-
-    // ========== SYNC METADATA (field/array-level merge support) ==========
-    // See MERGE_SYNC_DESIGN.md for the full semantics. Summary: `version` is
-    // a Lamport logical clock (bumped on every local edit, set to
-    // max(local,remote)+1 on merge) - NOT a wall-clock timestamp, and never
-    // compared across devices' clocks. `updatedAt` is wall-clock but is
-    // display-only and must never be read by any merge/conflict logic.
-    // `deletedAt` is a tombstone marker (soft delete). `schemaVersion` is
-    // for future field-shape migrations of this one entity.
-    const SYNC_SCHEMA_VERSION = 1;
-
-    function nowIso() {
-      return new Date().toISOString();
-    }
-
-    // Attach fresh sync metadata to a brand-new entity (member, record,
-    // reminder, policy, ledger row, coverage, rider, sumInsuredHistory
-    // entry, claim, surrender record, ...). Call this once at creation time;
-    // call bumpVersion() on every subsequent edit.
-    function freshSyncMeta() {
-      return { version: 1, updatedAt: nowIso(), deletedAt: null, schemaVersion: SYNC_SCHEMA_VERSION };
-    }
-
-    // Call on every local edit to an entity that already has sync metadata
-    // (i.e. after migration, everything). Mutates in place.
-    function bumpVersion(entity) {
-      if (!entity || typeof entity !== 'object') return entity;
-      entity.version = (Number.isFinite(entity.version) ? entity.version : 1) + 1;
-      entity.updatedAt = nowIso();
-      return entity;
-    }
-
-    // Persistent per-device identity, used only for conflict-queue
-    // provenance/debugging (see design doc 1.3) - NEVER as a tie-breaker in
-    // merge logic. Stored outside STORAGE_KEY/members on purpose, so it is
-    // untouched by export/import and survives independently per browser.
-    const DEVICE_ID_KEY = 'family_health_tracker_device_id';
-    let _deviceId = null;
-    function getDeviceId() {
-      if (_deviceId) return _deviceId;
-      try {
-        let id = localStorage.getItem(DEVICE_ID_KEY);
-        if (!id) {
-          id = (typeof crypto !== 'undefined' && crypto.randomUUID)
-            ? crypto.randomUUID()
-            : freshId('dev');
-          localStorage.setItem(DEVICE_ID_KEY, id);
-        }
-        _deviceId = id;
-      } catch (e) {
-        // localStorage unavailable (private mode edge cases etc.) - fall
-        // back to an in-memory id for this session only. Provenance-only
-        // field, so a non-persistent fallback here is not a correctness risk.
-        _deviceId = freshId('dev');
-      }
-      return _deviceId;
-    }
-
-    // Scalar member fields tracked individually via member.fieldVersion, so
-    // two people editing different fields on the same member (e.g. A changes
-    // phone, B changes allergies) never conflict with or clobber each other.
-    // NOTE: keep this list in sync with the fields actually collected in
-    // saveMember()'s `fields` object - any field added there without being
-    // added here silently falls back to whole-member conflict granularity.
-    const MEMBER_SCALAR_FIELDS = [
-      'name', 'nameZh', 'nameZhAvatarIdx', 'gender', 'birth', 'blood',
-      'height', 'allergies', 'emergency', 'bloodTypeAttachment'
-    ];
-    // history is handled separately (id+version entry array, see design 1.10 / 2.1), not a plain scalar.
-
-    function freshFieldVersions() {
-      const fv = {};
-      MEMBER_SCALAR_FIELDS.forEach(f => { fv[f] = 1; });
-      return fv;
-    }
-
-    // Bumps the fieldVersion entry for exactly the scalar fields that
-    // actually changed between `before` and `after` (shallow compare via
-    // JSON.stringify - fine for these field types: strings/numbers/null and
-    // the small bloodTypeAttachment object). Also bumps entity.version once
-    // if anything changed, matching bumpVersion()'s semantics.
-    function bumpFieldVersions(member, before, after) {
-      if (!member.fieldVersion) member.fieldVersion = freshFieldVersions();
-      let changed = false;
-      MEMBER_SCALAR_FIELDS.forEach(f => {
-        if (JSON.stringify(before[f]) !== JSON.stringify(after[f])) {
-          member.fieldVersion[f] = (member.fieldVersion[f] || 1) + 1;
-          changed = true;
-        }
-      });
-      if (changed) bumpVersion(member);
-      return changed;
-    }
-
-    // Converts a plain history/notes string into the id+version entry-array
-    // shape (design 1.10). v1 UI still edits this as a single block, so in
-    // practice this array holds one entry that gets its version bumped on
-    // edit - but the shape is future-proof for a later "append a new entry"
-    // affordance without a text-migration headache.
-    function historyTextToEntries(text) {
-      const t = (text || '').trim();
-      if (!t) return [];
-      return [{ id: freshId('hx'), version: 1, text: t, deletedAt: null }];
-    }
-    // Reads the current effective history text back out of the entry array
-    // (v1: just the latest non-deleted entry's text) for anywhere the app
-    // still wants a plain string (rendering, reminders' `.includes(...)` check).
-    function historyEntriesToText(entries) {
-      if (!Array.isArray(entries)) return '';
-      const live = entries.filter(e => !e.deletedAt);
-      return live.length ? live[live.length - 1].text : '';
-    }
-
-    // For sub-entities that get rebuilt as a whole array on each save (policy
-    // coverages/riders, edited via a temp array and committed together) -
-    // matches newArr items to priorArr by id, carries forward
-    // version/deletedAt/schemaVersion, and bumps version only if the
-    // non-metadata content actually changed (mirrors bumpFieldVersions'
-    // diff-before-bump discipline, so re-saving a policy with no real
-    // changes to a given coverage/rider doesn't manufacture a fake
-    // conflict later). Items with no matching prior id are new -> freshSyncMeta().
-    // For sub-entities that get rebuilt as a whole array on each save (policy
-    // coverages/riders, edited via a temp array and committed together) -
-    // matches newArr items to priorArr by id, carries forward
-    // version/deletedAt/schemaVersion, and bumps version only if the
-    // non-metadata content actually changed (mirrors bumpFieldVersions'
-    // diff-before-bump discipline, so re-saving a policy with no real
-    // changes to a given coverage/rider doesn't manufacture a fake
-    // conflict later). Items with no matching prior id are new -> freshSyncMeta().
-    // Returns a NEW array - not just newArr mutated - because an existing
-    // item the user removed from the temp editing array (i.e. present in
-    // priorArr but missing from newArr) is soft-deleted and put BACK into
-    // the result as a tombstone, rather than allowed to physically vanish.
-    function syncStampSubEntities(priorArr, newArr) {
-      const priorById = new Map((priorArr || []).map(x => [x.id, x]));
-      const stripMeta = obj => {
-        const c = { ...obj };
-        delete c.version; delete c.deletedAt; delete c.schemaVersion; delete c.updatedAt;
-        return c;
-      };
-      const seenIds = new Set();
-      const result = (newArr || []).map(item => {
-        seenIds.add(item.id);
-        const prior = priorById.get(item.id);
-        if (prior) {
-          item.version = prior.version;
-          item.deletedAt = prior.deletedAt;
-          item.schemaVersion = prior.schemaVersion || SYNC_SCHEMA_VERSION;
-          item.updatedAt = prior.updatedAt || nowIso();
-          if (JSON.stringify(stripMeta(prior)) !== JSON.stringify(stripMeta(item))) bumpVersion(item);
-        } else {
-          Object.assign(item, freshSyncMeta());
-        }
-        return item;
-      });
-      (priorArr || []).forEach(prior => {
-        if (seenIds.has(prior.id)) return;
-        if (prior.deletedAt) { result.push(prior); return; } // already tombstoned - keep, per 1.8 (permanent)
-        result.push(tombstone({ ...prior }));
-      });
-      return result;
-    }
-
-
-    // Attachment-array equivalent of syncStampSubEntities, but simpler:
-    // attachments are immutable once uploaded (id + tombstone only, no
-    // version - see design 1.9), so this only needs to catch items removed
-    // from the temp editing array and turn them into tombstones instead of
-    // letting them silently vanish on save.
-    function syncStampAttachments(priorArr, newArr) {
-      const seenIds = new Set((newArr || []).map(a => a.id));
-      const result = [...(newArr || [])];
-      (priorArr || []).forEach(prior => {
-        if (seenIds.has(prior.id)) return;
-        result.push(prior.deletedAt ? prior : { ...prior, deletedAt: nowIso() });
-      });
-      return result;
-    }
-
-    // the app displays/consumes a list rather than editing a specific known
-    // entity. Deletion is now soft (writes deletedAt) rather than splicing,
-    // per design 1.8/2.5 - every read site that shows a list to the user
-    // needs to filter through this or a tombstoned entry will "come back"
-    // in that view even though it was deleted.
-    function live(arr) {
-      return (arr || []).filter(x => !x || !x.deletedAt);
-    }
-
-    // Soft-deletes an entity: writes deletedAt + bumps version, instead of
-    // splicing it out of its array. See design 1.7/1.8/2.5. Call this from
-    // every delete action instead of Array#splice/#filter-out.
-    function tombstone(entity) {
-      if (!entity) return entity;
-      entity.deletedAt = nowIso();
-      bumpVersion(entity);
-      return entity;
-    }
-
-    // existing (pre-merge-sync-feature) member data: called once at load
-    // time for both real user data and DEMO_DATA. Idempotent - entities that
-    // already have a `version` field are left untouched, so re-running this
-    // on already-migrated data (e.g. after a fresh import of an old-format
-    // single-member file) is always safe.
-    function migrateSyncFields(allMembers) {
-      if (!Array.isArray(allMembers)) return allMembers;
-
-      // Generic recursive stamp for any array of id-bearing entities nested
-      // under insurance (ledger rows, riders, coverages, sumInsuredHistory,
-      // surrender records, claims, ...). Attachments get the reduced
-      // id+deletedAt-only shape per design 1.9/2.2, not a full version stamp.
-      function stampArray(arr, { attachmentsOnly = false } = {}) {
-        if (!Array.isArray(arr)) return;
-        arr.forEach(item => {
-          if (!item || typeof item !== 'object') return;
-          if (attachmentsOnly) {
-            if (!('deletedAt' in item)) item.deletedAt = null;
-            return;
-          }
-          if (!Number.isFinite(item.version)) item.version = 1;
-          if (!('updatedAt' in item) || !item.updatedAt) item.updatedAt = nowIso();
-          if (!('deletedAt' in item)) item.deletedAt = null;
-          if (!Number.isFinite(item.schemaVersion)) item.schemaVersion = SYNC_SCHEMA_VERSION;
-        });
-      }
-
-      function stampPolicy(p) {
-        if (!p || typeof p !== 'object') return;
-        if (!Number.isFinite(p.version)) p.version = 1;
-        if (!('updatedAt' in p) || !p.updatedAt) p.updatedAt = nowIso();
-        if (!('deletedAt' in p)) p.deletedAt = null;
-        if (!Number.isFinite(p.schemaVersion)) p.schemaVersion = SYNC_SCHEMA_VERSION;
-        stampArray(p.ledger);
-        stampArray(p.riders);
-        stampArray(p.coverages);
-        (p.coverages || []).forEach(c => stampArray(c.sumInsuredHistory));
-        stampArray(p.surrenderRecords);
-        stampArray(p.attachments, { attachmentsOnly: true });
-        (p.ledger || []).forEach(l => stampArray(l.attachments, { attachmentsOnly: true }));
-        (p.surrenderRecords || []).forEach(s => stampArray(s.attachments, { attachmentsOnly: true }));
-      }
-
-      allMembers.forEach(m => {
-        if (!m || typeof m !== 'object') return;
-
-        if (!Number.isFinite(m.version)) m.version = 1;
-        if (!('updatedAt' in m) || !m.updatedAt) m.updatedAt = nowIso();
-        if (!('deletedAt' in m)) m.deletedAt = null;
-        if (!Number.isFinite(m.schemaVersion)) m.schemaVersion = SYNC_SCHEMA_VERSION;
-        if (!m.fieldVersion) m.fieldVersion = freshFieldVersions();
-
-        // history: add the id+version entry-array shadow alongside the
-        // existing m.history string, WITHOUT touching m.history itself yet.
-        // Every current render/read site in the app (BP reminder check,
-        // print views, the edit form, etc.) still reads m.history as a
-        // plain string - rewiring all of those to read through
-        // historyEntriesToText()/write through historyTextToEntries() is
-        // deliberately left for the merge-wiring step (build order step 4),
-        // not bundled into this data-layer pass. Until that wiring lands,
-        // historyEntries exists but is not yet the source of truth -
-        // m.history remains authoritative.
-        if (!Array.isArray(m.historyEntries)) {
-          m.historyEntries = historyTextToEntries(m.history);
-        }
-
-        stampArray(m.records);
-        (m.records || []).forEach(r => stampArray(r.attachments, { attachmentsOnly: true }));
-        stampArray(m.customReminders);
-        if (m.bloodTypeAttachment && typeof m.bloodTypeAttachment === 'object' && !('deletedAt' in m.bloodTypeAttachment)) {
-          m.bloodTypeAttachment.deletedAt = null;
-        }
-
-        if (m.insurance && Array.isArray(m.insurance.policies)) {
-          m.insurance.policies.forEach(stampPolicy);
-        }
-        if (m.insurance && Array.isArray(m.insurance.claims)) {
-          stampArray(m.insurance.claims);
-        }
-      });
-
-      return allMembers;
-    }
-
     // Returns a NEW array of records sorted by date descending (newest first).
     // Never mutates m.records, so "latest" values stay consistent no matter
     // which tabs the user has viewed.
     function recordsByDateDesc(m) {
-      return live(m.records).sort((a, b) => new Date(b.date) - new Date(a.date));
+      return [...(m.records || [])].sort((a, b) => new Date(b.date) - new Date(a.date));
     }
 
     // Finds the most recent record (by date) that has vitals, and returns its vitals.
@@ -1042,7 +746,6 @@
           (m.insurance.policies || []).forEach(p => {
             (p.attachments || []).forEach(a => { if (a.id) ids.push(a.id); });
             (p.ledger || []).forEach(l => (l.attachments || []).forEach(a => { if (a.id) ids.push(a.id); }));
-            (p.surrenderRecords || []).forEach(r => (r.attachments || []).forEach(a => { if (a.id) ids.push(a.id); }));
           });
         }
       });
@@ -1204,7 +907,7 @@
           await idbPut(id, att.data);
           let thumb = att.thumb;
           if (!thumb && att.type === 'image') thumb = await makeThumbFromDataUrl(att.data);
-          out.push({ id, name: att.name, path: att.path, type: att.type, thumb, size: att.size || att.data.length, deletedAt: null });
+          out.push({ id, name: att.name, path: att.path, type: att.type, thumb, size: att.size || att.data.length });
         } else {
           out.push(att);
         }
@@ -1464,7 +1167,6 @@
           const jsonStr = await decryptText(saved, cryptoKey);
           const parsed = JSON.parse(jsonStr);
           members = (Array.isArray(parsed) && parsed.length > 0) ? parsed : [];
-          migrateSyncFields(members);
         } catch (e) {
           alert('⚠️ Your data could not be decrypted even though the passcode was accepted. ' +
                 'To avoid data loss, the app will not load or overwrite anything. ' +
@@ -1478,21 +1180,17 @@
           const parsed = JSON.parse(saved);
           if (Array.isArray(parsed) && parsed.length > 0) {
             members = parsed;
-            migrateSyncFields(members);
           } else {
             members = JSON.parse(JSON.stringify(DEMO_DATA));
-            migrateSyncFields(members);
             saveData();
           }
         } catch(e) {
           members = JSON.parse(JSON.stringify(DEMO_DATA));
-          migrateSyncFields(members);
           saveData();
         }
       } else {
         // First time - load demo data
         members = JSON.parse(JSON.stringify(DEMO_DATA));
-        migrateSyncFields(members);
         saveData();
       }
 
@@ -1500,7 +1198,6 @@
       bindEvents();
       renderMemberList();
       renderMain();
-      updateConflictBadge();
     }
 
     // Encrypts the ENTIRE app data blob (all members: health + insurance) before
@@ -1586,101 +1283,9 @@
       renderMain();
     }
 
-    // Human-readable labels for the modal - kept separate from any
-    // internal field/container key names so this can be reworded freely.
-    const CONFLICT_FIELD_LABELS = {
-      name: 'Name', nameZh: 'Chinese name', gender: 'Gender', birth: 'Date of birth',
-      blood: 'Blood type', height: 'Height', allergies: 'Allergies', emergency: 'Emergency contact',
-      bloodTypeAttachment: 'Blood type document'
-    };
-    const CONFLICT_CONTAINER_LABELS = {
-      records: 'Health record', customReminders: 'Reminder', historyEntries: 'Medical history note',
-      policies: 'Policy', ledger: 'Premium payment', riders: 'Rider',
-      coverages: 'Coverage', sumInsuredHistory: 'Sum insured entry', surrenderRecords: 'Surrender/statement record',
-      claims: 'Claim'
-    };
-    // A short one-line summary per entity type, for the two "before/after"
-    // columns - design 2.7 explicitly wants no inline diffing, just enough
-    // to tell the two versions apart at a glance.
-    function summarizeConflictSide(containerKey, obj) {
-      if (obj === null || obj === undefined) return '(none)';
-      if (typeof obj !== 'object') return escapeHtml(String(obj)); // field-level conflicts are plain values
-      switch (containerKey) {
-        case 'records': return escapeHtml(`${obj.title || obj.type || 'Record'} · ${obj.date || ''}`);
-        case 'customReminders': return escapeHtml(`${obj.title || 'Reminder'} · due ${obj.dueDate || ''}`);
-        case 'historyEntries': return escapeHtml(obj.text || '');
-        case 'policies': return escapeHtml(`${obj.provider || ''} ${obj.number || ''} · ${insFmtMoney(obj.premium)}/${obj.frequency || ''}`);
-        case 'ledger': return escapeHtml(`${obj.date || ''} · ${insFmtMoney(obj.amount)} (${obj.method || ''})`);
-        case 'riders': return escapeHtml(`${obj.description || ''} · due ${obj.dueDate || ''}`);
-        case 'coverages': return escapeHtml(`${obj.customLabel || obj.type || ''} · sum insured ${insFmtMoney(obj.sumInsured)}`);
-        case 'sumInsuredHistory': return escapeHtml(`${obj.date || ''} · ${insFmtMoney(obj.amount)}`);
-        case 'surrenderRecords': return escapeHtml(`${obj.date || ''} · ${insFmtMoney(insSurrenderRecordTotal(obj))}`);
-        case 'claims': return escapeHtml(`${obj.date || ''} · ${obj.status || ''} · claimed ${insFmtMoney(obj.amountClaimed)}`);
-        default: return escapeHtml(JSON.stringify(obj).slice(0, 120));
-      }
-    }
-
-    function renderConflictModal() {
-      const active = getActiveConflicts();
-      const body = document.getElementById('conflictListBody');
-      const btn = document.getElementById('btnConflicts');
-      const countEl = document.getElementById('conflictCount');
-      countEl.textContent = active.length;
-      btn.style.display = active.length ? '' : 'none';
-
-      if (!active.length) {
-        body.innerHTML = '<p class="s-51f2817c">No pending conflicts.</p>';
-        return;
-      }
-
-      body.innerHTML = active.map((c, i) => {
-        const label = c.field
-          ? (CONFLICT_FIELD_LABELS[c.field] || c.field)
-          : (CONFLICT_CONTAINER_LABELS[c.path[c.path.length - 2]] || 'Item');
-        const containerKey = c.field ? null : c.path[c.path.length - 2];
-        const localSummary = summarizeConflictSide(containerKey, c.local);
-        const remoteSummary = summarizeConflictSide(containerKey, c.remote);
-        const allowBoth = !c.field; // "keep both" only makes sense for array-item entities, not a single scalar field
-        return `
-          <div class="s-198fb7f4" data-conflict-idx="${i}">
-            <div class="s-ea8a0de7">${escapeHtml(c.memberName)} — ${escapeHtml(label)}</div>
-            <div class="s-ebc463b1">Your version: ${localSummary}</div>
-            <div class="s-ebc463b1">Their version: ${remoteSummary}</div>
-            <div class="s-79744520">
-              <button class="btn btn-secondary btn-sm" data-conflict-choice="local" data-conflict-idx="${i}">Keep Mine</button>
-              <button class="btn btn-secondary btn-sm" data-conflict-choice="remote" data-conflict-idx="${i}">Keep Theirs</button>
-              ${allowBoth ? `<button class="btn btn-secondary btn-sm" data-conflict-choice="both" data-conflict-idx="${i}">Keep Both</button>` : ''}
-            </div>
-          </div>
-        `;
-      }).join('');
-
-      body.querySelectorAll('[data-conflict-choice]').forEach(el => {
-        el.addEventListener('click', () => {
-          const idx = parseInt(el.dataset.conflictIdx);
-          const conflict = active[idx];
-          resolveConflict(conflict, el.dataset.conflictChoice);
-          renderConflictModal();
-          renderMain(); // the resolved field/entity may be visible on the current tab
-        });
-      });
-    }
-
-    function openConflictModal() {
-      renderConflictModal();
-      document.getElementById('conflictModal').classList.add('active');
-    }
-    function updateConflictBadge() {
-      const active = getActiveConflicts();
-      document.getElementById('conflictCount').textContent = active.length;
-      document.getElementById('btnConflicts').style.display = active.length ? '' : 'none';
-    }
-
     // ========== EVENT BINDING ==========
     function bindEvents() {
       // Header buttons
-      document.getElementById('btnConflicts').addEventListener('click', openConflictModal);
-      document.getElementById('btnCloseConflicts').addEventListener('click', () => document.getElementById('conflictModal').classList.remove('active'));
       document.getElementById('btnExport').addEventListener('click', () => openExportOptionsModal('all'));
       document.getElementById('btnExportMember').addEventListener('click', () => openExportOptionsModal('member'));
       document.getElementById('btnImport').addEventListener('click', () => document.getElementById('importFile').click());
@@ -1732,12 +1337,11 @@
     function renderMemberList() {
       updateStorageMeter();
       const list = document.getElementById('memberList');
-      const liveMembers = live(members);
-      if (liveMembers.length === 0) {
+      if (members.length === 0) {
         list.innerHTML = '<div class="s-3d9b1e10">No members yet<br>Click below to add</div>';
         return;
       }
-      list.innerHTML = liveMembers.map(m => {
+      list.innerHTML = members.map(m => {
         const age = m.birth ? Math.floor((new Date() - new Date(m.birth)) / 365.25 / 24 / 60 / 60 / 1000) : '?';
         return `
           <div class="member-item ${m.id === currentMemberId ? 'active' : ''}" data-id="${escapeHtml(m.id)}">
@@ -1815,7 +1419,7 @@
       const latestVitals = getLatestVitals(m);
       const bmi = calcBmi(m.height, latestVitals.weight);
 
-      const bpRecords = live(m.records).filter(r => r.vitals?.systolic).sort((a,b) => new Date(a.date) - new Date(b.date));
+      const bpRecords = m.records.filter(r => r.vitals?.systolic).sort((a,b) => new Date(a.date) - new Date(b.date));
       const chartHtml = bpRecords.length > 1 ? renderBPChart(bpRecords) : '<p class="s-b9373de3">Record more BP data to see trends</p>';
 
       const reminders = generateReminders(m);
@@ -1937,7 +1541,7 @@
         item.addEventListener('click', () => {
           const memberObj = members.find(x => x.id === currentMemberId);
           const record = memberObj?.records.find(x => x.id === item.dataset.recordId);
-          const att = record ? live(record.attachments || [])[parseInt(item.dataset.attIdx)] : null;
+          const att = record?.attachments?.[parseInt(item.dataset.attIdx)];
           openAttachment(att);
         });
       });
@@ -2019,15 +1623,14 @@
     function renderRecords(m) {
       return `
         <div class="card">
-          <div class="card-title">📋 Health Records (${live(m.records).length})</div>
+          <div class="card-title">📋 Health Records (${m.records.length})</div>
           <div class="timeline">
             ${recordsByDateDesc(m).map(r => {
               const color = r.type === 'Hospitalization' ? 'purple' : r.type === 'Illness' ? 'red' : r.type === 'Vaccine' ? 'green' : r.type === 'Medication' ? 'yellow' : 'primary';
               const icon = { 'Checkup':'🏥','Vaccine':'💉','Illness':'🤒','Hospitalization':'🚑','Medication':'💊','Lab Test':'🔬','Monitoring':'📊' }[r.type] || '📋';
-              const liveAtts = live(r.attachments || []);
-              const attachmentsHtml = liveAtts.length ? `
+              const attachmentsHtml = r.attachments?.length ? `
                 <div class="attachment-list s-d79ce2bc">
-                  ${liveAtts.map((att, idx) => renderAttachmentItem(att, r.id, idx)).join('')}
+                  ${r.attachments.map((att, idx) => renderAttachmentItem(att, r.id, idx)).join('')}
                 </div>
               ` : '';
               return `
@@ -2440,7 +2043,7 @@
     }
 
     function renderWeightChart(m) {
-      const weightRecords = live(m.records).filter(r => r.vitals?.weight).sort((a,b) => new Date(a.date) - new Date(b.date));
+      const weightRecords = m.records.filter(r => r.vitals?.weight).sort((a,b) => new Date(a.date) - new Date(b.date));
       if (weightRecords.length < 2) return '<p class="s-b9373de3">Record more weight data to see trends</p>';
 
       const w = 600, h = 200, pad = 40;
@@ -2474,7 +2077,7 @@
       const reminders = [];
       const today = new Date();
 
-      const lastExam = live(m.records).filter(r => r.type === 'Checkup').sort((a,b) => new Date(b.date) - new Date(a.date))[0];
+      const lastExam = m.records.filter(r => r.type === 'Checkup').sort((a,b) => new Date(b.date) - new Date(a.date))[0];
       if (lastExam) {
         const examDate = new Date(lastExam.date);
         const nextExam = new Date(examDate); nextExam.setFullYear(nextExam.getFullYear() + 1);
@@ -2488,7 +2091,7 @@
         });
       }
 
-      const lastFlu = live(m.records).filter(r => r.type === 'Vaccine' && r.title.includes('Flu')).sort((a,b) => new Date(b.date) - new Date(a.date))[0];
+      const lastFlu = m.records.filter(r => r.type === 'Vaccine' && r.title.includes('Flu')).sort((a,b) => new Date(b.date) - new Date(a.date))[0];
       if (lastFlu) {
         const fluDate = new Date(lastFlu.date);
         const nextFlu = new Date(fluDate); nextFlu.setFullYear(nextFlu.getFullYear() + 1);
@@ -2503,7 +2106,7 @@
       }
 
       if (m.history.includes('Hypertension')) {
-        const lastBP = live(m.records).filter(r => r.vitals?.systolic).sort((a,b) => new Date(b.date) - new Date(a.date))[0];
+        const lastBP = m.records.filter(r => r.vitals?.systolic).sort((a,b) => new Date(b.date) - new Date(a.date))[0];
         if (lastBP) {
           const bpDate = new Date(lastBP.date);
           const daysSince = Math.floor((today - bpDate) / 86400000);
@@ -2517,7 +2120,7 @@
         }
       }
 
-      live(m.customReminders || []).forEach(cr => {
+      (m.customReminders || []).forEach(cr => {
         const dueDate = new Date(cr.dueDate);
         const daysDiff = Math.floor((dueDate - today) / 86400000);
         reminders.push({
@@ -2587,17 +2190,8 @@
       if (!m.customReminders) m.customReminders = [];
       const previousReminders = [...m.customReminders];
       const idx = m.customReminders.findIndex(x => x.id === reminder.id);
-      if (idx > -1) {
-        const prior = m.customReminders[idx];
-        reminder.version = prior.version;
-        reminder.deletedAt = prior.deletedAt;
-        reminder.schemaVersion = prior.schemaVersion || SYNC_SCHEMA_VERSION;
-        bumpVersion(reminder);
-        m.customReminders[idx] = reminder;
-      } else {
-        Object.assign(reminder, freshSyncMeta());
-        m.customReminders.push(reminder);
-      }
+      if (idx > -1) m.customReminders[idx] = reminder;
+      else m.customReminders.push(reminder);
 
       if (!saveData()) { m.customReminders = previousReminders; return; }
       closeReminderModal();
@@ -2609,10 +2203,8 @@
       if (!m) return;
       if (!confirm('Delete this reminder?')) return;
       const previousReminders = [...(m.customReminders || [])];
-      const cr = (m.customReminders || []).find(x => x.id === id);
-      const priorMeta = cr ? { deletedAt: cr.deletedAt, version: cr.version, updatedAt: cr.updatedAt } : null;
-      if (cr) tombstone(cr);
-      if (!saveData()) { m.customReminders = previousReminders; if (cr) Object.assign(cr, priorMeta); return; }
+      m.customReminders = (m.customReminders || []).filter(x => x.id !== id);
+      if (!saveData()) { m.customReminders = previousReminders; return; }
       renderMain();
     }
 
@@ -2623,18 +2215,16 @@
       const cr = (m.customReminders || []).find(x => x.id === id);
       if (!cr) return;
       const previousReminders = [...m.customReminders];
-      const priorMeta = { dueDate: cr.dueDate, deletedAt: cr.deletedAt, version: cr.version, updatedAt: cr.updatedAt };
 
       if (cr.repeatMonths > 0) {
         const next = new Date();
         next.setMonth(next.getMonth() + cr.repeatMonths);
         cr.dueDate = next.toISOString().slice(0, 10);
-        bumpVersion(cr);
       } else {
-        tombstone(cr);
+        m.customReminders = m.customReminders.filter(x => x.id !== id);
       }
 
-      if (!saveData()) { m.customReminders = previousReminders; Object.assign(cr, priorMeta); return; }
+      if (!saveData()) { m.customReminders = previousReminders; return; }
       renderMain();
     }
 
@@ -2702,7 +2292,7 @@
           document.getElementById('vTemp').value = record.vitals?.temp ?? '';
           document.getElementById('vGlucose').value = record.vitals?.glucose ?? '';
           document.getElementById('vWeight').value = record.vitals?.weight ?? '';
-          tempAttachments = live(record.attachments || []).map(a => ({ ...a }));
+          tempAttachments = (record.attachments || []).map(a => ({ ...a }));
           renderAttachmentPreview();
         } else {
           if (header) header.textContent = 'Add Health Record';
@@ -2765,16 +2355,14 @@
         const m = members.find(x => x.id === editingMemberId);
         if (!m) return;
         const oldAttId = m.bloodTypeAttachment?.id;
-        const before = {}; MEMBER_SCALAR_FIELDS.forEach(f => { before[f] = m[f]; });
         Object.assign(m, fields);
-        bumpFieldVersions(m, before, fields); // per-field version bump, see design 2.1
         if (!saveData()) return; // keep modal open so nothing is lost if storage failed
         if (oldAttId && oldAttId !== fields.bloodTypeAttachment?.id) idbDelete(oldAttId);
         renderMemberList();
         closeModal('member');
         renderMain();
       } else {
-        const member = { id: Date.now().toString(), ...fields, records: [], ...freshSyncMeta(), fieldVersion: freshFieldVersions(), historyEntries: historyTextToEntries(fields.history) };
+        const member = { id: Date.now().toString(), ...fields, records: [] };
         members.push(member);
         if (!saveData()) { members.pop(); return; }
         renderMemberList();
@@ -2787,9 +2375,6 @@
       if (!currentMemberId) return alert('Please select a member first');
       if (!(await ensureUnlocked())) return;
 
-      const mForAttachments = members.find(x => x.id === currentMemberId);
-      const priorRecordForAttachments = editingRecordId ? mForAttachments.records.find(r => r.id === editingRecordId) : null;
-      const persistedRecordAtt = await persistAttachmentsToIdb(tempAttachments);
       const record = {
         id: editingRecordId || ('r' + Date.now()),
         date: document.getElementById('rDate').value,
@@ -2798,7 +2383,7 @@
         details: document.getElementById('rDetails').value,
         tags: document.getElementById('rTags').value.split(',').map(t => t.trim()).filter(t => t),
         vitals: {},
-        attachments: syncStampAttachments(priorRecordForAttachments ? priorRecordForAttachments.attachments : [], persistedRecordAtt)
+        attachments: await persistAttachmentsToIdb(tempAttachments)
       };
 
       const vSystolic = document.getElementById('vSystolic').value;
@@ -2815,7 +2400,7 @@
       if (vWeight) record.vitals.weight = parseFloat(vWeight);
 
       if (Object.keys(record.vitals).length === 0) delete record.vitals;
-      if (record.attachments.length === 0) delete record.attachments; // fine: syncStampAttachments never returns an empty array if a tombstone exists
+      if (record.attachments.length === 0) delete record.attachments;
 
       const m = members.find(x => x.id === currentMemberId);
       const existingIdx = editingRecordId ? m.records.findIndex(r => r.id === editingRecordId) : -1;
@@ -2825,24 +2410,16 @@
       const oldAttachmentIds = existingIdx > -1 ? (m.records[existingIdx].attachments || []).map(a => a.id).filter(Boolean) : [];
 
       if (existingIdx > -1) {
-        // Preserve sync metadata identity across an edit: bump version,
-        // don't reset it to 1, and don't touch deletedAt/schemaVersion.
-        const prior = m.records[existingIdx];
-        record.version = prior.version;
-        record.deletedAt = prior.deletedAt;
-        record.schemaVersion = prior.schemaVersion || SYNC_SCHEMA_VERSION;
-        bumpVersion(record);
         m.records[existingIdx] = record;
       } else {
-        Object.assign(record, freshSyncMeta());
         m.records.push(record);
       }
 
       if (!saveData()) { m.records = previousRecords; return; }
 
-      // Clean up attachment files that were removed (now tombstoned) during this edit.
-      const newLiveIds = new Set(live(record.attachments || []).map(a => a.id).filter(Boolean));
-      const removedIds = oldAttachmentIds.filter(id => !newLiveIds.has(id));
+      // Clean up attachment files that were removed during this edit.
+      const newIds = new Set((record.attachments || []).map(a => a.id).filter(Boolean));
+      const removedIds = oldAttachmentIds.filter(id => !newIds.has(id));
       if (removedIds.length) idbDeleteMany(removedIds);
 
       closeModal('record');
@@ -2858,13 +2435,8 @@
       if (!confirm(`Delete this record ("${r.title}", ${r.date})? This cannot be undone.`)) return;
 
       const previousRecords = [...m.records];
-      const priorMeta = { deletedAt: r.deletedAt, version: r.version, updatedAt: r.updatedAt };
-      tombstone(r);
-      if (!saveData()) { m.records = previousRecords; Object.assign(r, priorMeta); return; }
-      // The tombstone (id + deletedAt) stays in the record forever so the
-      // deletion can propagate to other devices on next sync - but the
-      // actual attachment BYTES in IndexedDB are locally purged right away,
-      // since nothing needs them once this record is gone from view here.
+      m.records = m.records.filter(x => x.id !== recordId);
+      if (!saveData()) { m.records = previousRecords; return; }
       const idsToRemove = (r.attachments || []).map(a => a.id).filter(Boolean);
       if (idsToRemove.length) idbDeleteMany(idsToRemove);
       renderMain();
@@ -2877,9 +2449,8 @@
       if (!confirm(`Delete "${m.name}" and all their records? This cannot be undone.`)) return;
 
       const previousMembers = members;
-      const priorMeta = { deletedAt: m.deletedAt, version: m.version, updatedAt: m.updatedAt };
-      tombstone(m);
-      if (!saveData()) { members = previousMembers; Object.assign(m, priorMeta); return; }
+      members = members.filter(x => x.id !== memberId);
+      if (!saveData()) { members = previousMembers; return; }
       const idsToRemove = [];
       (m.records || []).forEach(r => (r.attachments || []).forEach(a => { if (a.id) idsToRemove.push(a.id); }));
       if (m.bloodTypeAttachment?.id) idsToRemove.push(m.bloodTypeAttachment.id);
@@ -2897,13 +2468,13 @@
     // modal can list only the attachments that are actually relevant to
     // that specific report.
     const reportMeta = {
-      summary:    { label: 'Health Summary', printFn: printHealthSummary,   recordsFor: m => live(m.records) },
-      vaccine:    { label: 'Vaccine Record', printFn: printVaccineCard,     recordsFor: m => live(m.records).filter(r => r.type === 'Vaccine') },
-      medication: { label: 'Medication List', printFn: printMedicationList, recordsFor: m => live(m.records).filter(r => r.type === 'Medication') },
-      lab:        { label: 'Lab Results', printFn: printLabSummary,         recordsFor: m => live(m.records).filter(r => r.type === 'Lab Test' || r.type === 'Checkup') },
-      bp:         { label: 'BP Log', printFn: printBPLog,                   recordsFor: m => live(m.records).filter(r => r.vitals?.systolic) },
-      growth:     { label: 'Growth Chart', printFn: printGrowthChart,       recordsFor: m => live(m.records).filter(r => r.vitals?.weight) },
-      annual:     { label: 'Annual Report', printFn: printAnnualReport,     recordsFor: m => { const y = String(new Date().getFullYear()); return live(m.records).filter(r => r.date && r.date.startsWith(y)); } }
+      summary:    { label: 'Health Summary', printFn: printHealthSummary,   recordsFor: m => m.records },
+      vaccine:    { label: 'Vaccine Record', printFn: printVaccineCard,     recordsFor: m => m.records.filter(r => r.type === 'Vaccine') },
+      medication: { label: 'Medication List', printFn: printMedicationList, recordsFor: m => m.records.filter(r => r.type === 'Medication') },
+      lab:        { label: 'Lab Results', printFn: printLabSummary,         recordsFor: m => m.records.filter(r => r.type === 'Lab Test' || r.type === 'Checkup') },
+      bp:         { label: 'BP Log', printFn: printBPLog,                   recordsFor: m => m.records.filter(r => r.vitals?.systolic) },
+      growth:     { label: 'Growth Chart', printFn: printGrowthChart,       recordsFor: m => m.records.filter(r => r.vitals?.weight) },
+      annual:     { label: 'Annual Report', printFn: printAnnualReport,     recordsFor: m => { const y = String(new Date().getFullYear()); return m.records.filter(r => r.date && r.date.startsWith(y)); } }
     };
 
     let reportPreviewState = null; // { reportKey, memberId, attachments: [{key, record, att}] }
@@ -3018,85 +2589,6 @@
         </div>`;
     }
 
-    // ========== PRINT CURRENT PAGE (v41) ==========
-    // Same idea as the Ledger app's printCurrentApp(): one global 🖨️ button prints whatever
-    // the person is currently looking at -- a member's Health/Insurance view and its open
-    // tab -- rather than a purpose-built report. The heavy lifting is the @media print block
-    // in index.html (hides the header/sidebar/tabs/buttons/modals, un-clips the internally
-    // scrolling .main so it flows across pages); this function only adds a small header
-    // (app name, member + view, print time), retitles the document so "Save as PDF" gets a
-    // sensible filename, and undoes both afterwards. The 9 report popups below (Emergency
-    // Card, Health Summary, ...) are separate and unchanged.
-    const PRINT_HEALTH_TAB_LABELS = { overview: 'Overview', records: 'Records', charts: 'Trends', reminders: 'Reminders' };
-    const PRINT_INS_TAB_LABELS = { overview: 'Overview', policies: 'Policies', claims: 'Claims', reminders: 'Reminders', discontinued: 'Discontinued' };
-
-    // Read straight from the same state renderMain() renders from, so the printed title
-    // always matches what's on screen.
-    function getActivePageTitle() {
-      const m = members.find(x => x.id === currentMemberId);
-      if (!m) return 'Home';
-      if (viewMode === 'insurance') return `${m.name} — Insurance · ${PRINT_INS_TAB_LABELS[insCurrentSubTab] || 'Overview'}`;
-      return `${m.name} — Health · ${PRINT_HEALTH_TAB_LABELS[currentTab] || 'Overview'}`;
-    }
-
-    function printCurrentPage() {
-      // Locked = no data loaded and the lock screen covers everything; nothing to print.
-      const lock = document.getElementById('appLockScreen');
-      if (lock && getComputedStyle(lock).display !== 'none') return;
-
-      const container = document.querySelector('.container');
-      if (!container || !container.parentNode) { window.print(); return; }
-
-      const oldHeader = document.getElementById('printHeader');
-      if (oldHeader) oldHeader.remove();
-
-      const title = getActivePageTitle();
-      // textContent (not innerHTML): the title contains the member's name, which is user input.
-      const header = document.createElement('div');
-      header.id = 'printHeader';
-      const titleEl = document.createElement('div');
-      titleEl.className = 'print-header-title';
-      titleEl.textContent = '🏥🛡️ Family Health & Shield';
-      const subEl = document.createElement('div');
-      subEl.className = 'print-header-sub';
-      subEl.textContent = `${title} · Printed ${new Date().toLocaleString()}`;
-      header.appendChild(titleEl);
-      header.appendChild(subEl);
-      container.parentNode.insertBefore(header, container);
-
-      // Two cards exist purely to launch the report popups -- the Health Overview's "Reports"
-      // card (a row of buttons) and the Insurance Overview's "Generate a printable summary..."
-      // prompt card. Once the buttons are hidden for print they'd be an empty box / a stray
-      // sentence, so leave those cards off the printout entirely.
-      const skipCards = [];
-      document.querySelectorAll('#insBtnOpenReport, [data-report-type]').forEach(el => {
-        const card = el.closest('.card');
-        if (card && !skipCards.includes(card)) skipCards.push(card);
-      });
-      skipCards.forEach(card => card.classList.add('print-skip'));
-
-      const prevDocTitle = document.title;
-      document.title = `Family Health & Shield - ${title}`;
-
-      let cleanedUp = false;
-      let fallbackTimer = null;
-      const cleanup = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        clearTimeout(fallbackTimer);
-        header.remove();
-        skipCards.forEach(card => card.classList.remove('print-skip'));
-        document.title = prevDocTitle;
-      };
-      // afterprint fires for both "Print" and "Cancel"; the timeout is a guard for the rare
-      // browser/WebView that never fires it, so the temporary title can't get stuck.
-      window.addEventListener('afterprint', cleanup, { once: true });
-      fallbackTimer = setTimeout(cleanup, 60000);
-
-      window.print();
-    }
-    document.getElementById('btnPrintPage').addEventListener('click', printCurrentPage);
-
     // ========== EMERGENCY CARD ==========
     async function printEmergency(memberId) {
       const m = members.find(x => x.id === memberId);
@@ -3165,7 +2657,7 @@
       const latest = getLatestVitals(m);
       const bmi = calcBmi(m.height, latest.weight);
       const bloodAttData = await resolveAttachmentData(m.bloodTypeAttachment);
-      const attachmentsHtml = await buildAttachmentsSectionHtml(live(m.records), selectedAttachmentKeys);
+      const attachmentsHtml = await buildAttachmentsSectionHtml(m.records, selectedAttachmentKeys);
 
       const recordsHtml = recordsByDateDesc(m).map(r => `
         <tr>
@@ -3228,7 +2720,7 @@
           <div class="info-box"><div class="label">Glucose</div><div class="value">${latest.glucose || '--'} mmol/L</div></div>
         </div>
 
-        <h2>All Records (${live(m.records).length})</h2>
+        <h2>All Records (${m.records.length})</h2>
         <table>
           <tr><th>Date</th><th>Type</th><th>Title</th><th>Details</th></tr>
           ${recordsHtml || '<tr><td colspan="4" style="text-align:center;">No records</td></tr>'}
@@ -3246,7 +2738,7 @@
       if (!m) return;
       const age = m.birth ? Math.floor((new Date() - new Date(m.birth)) / 365.25 / 24 / 60 / 60 / 1000) : '?';
 
-      const vaccines = live(m.records).filter(r => r.type === 'Vaccine').sort((a,b) => new Date(a.date) - new Date(b.date));
+      const vaccines = m.records.filter(r => r.type === 'Vaccine').sort((a,b) => new Date(a.date) - new Date(b.date));
       const vaccineRows = vaccines.map((v, i) => `
         <tr>
           <td>${i + 1}</td>
@@ -3303,7 +2795,7 @@
       const m = members.find(x => x.id === memberId);
       if (!m) return;
 
-      const meds = live(m.records).filter(r => r.type === 'Medication').sort((a,b) => new Date(b.date) - new Date(a.date));
+      const meds = m.records.filter(r => r.type === 'Medication').sort((a,b) => new Date(b.date) - new Date(a.date));
       const medRows = meds.map(med => `
         <tr>
           <td>${escapeHtml(med.title)}</td>
@@ -3356,7 +2848,7 @@
       const m = members.find(x => x.id === memberId);
       if (!m) return;
 
-      const labs = live(m.records).filter(r => r.type === 'Lab Test' || r.type === 'Checkup').sort((a,b) => new Date(b.date) - new Date(a.date));
+      const labs = m.records.filter(r => r.type === 'Lab Test' || r.type === 'Checkup').sort((a,b) => new Date(b.date) - new Date(a.date));
 
       let labRows = '';
       labs.forEach(lab => {
@@ -3419,7 +2911,7 @@
       const m = members.find(x => x.id === memberId);
       if (!m) return;
 
-      const bpRecords = live(m.records).filter(r => r.vitals?.systolic).sort((a,b) => new Date(a.date) - new Date(b.date));
+      const bpRecords = m.records.filter(r => r.vitals?.systolic).sort((a,b) => new Date(a.date) - new Date(b.date));
 
       let bpRows = '';
       let totalSys = 0, totalDia = 0, count = 0;
@@ -3503,7 +2995,7 @@
       if (!m) return;
       const age = m.birth ? Math.floor((new Date() - new Date(m.birth)) / 365.25 / 24 / 60 / 60 / 1000) : '?';
 
-      const weightRecords = live(m.records).filter(r => r.vitals?.weight).sort((a,b) => new Date(a.date) - new Date(b.date));
+      const weightRecords = m.records.filter(r => r.vitals?.weight).sort((a,b) => new Date(a.date) - new Date(b.date));
 
       let growthRows = '';
       weightRecords.forEach(r => {
@@ -3569,14 +3061,14 @@
       const age = m.birth ? Math.floor((new Date() - new Date(m.birth)) / 365.25 / 24 / 60 / 60 / 1000) : '?';
       const year = new Date().getFullYear();
 
-      const yearRecords = live(m.records).filter(r => r.date.startsWith(year.toString()));
+      const yearRecords = m.records.filter(r => r.date.startsWith(year.toString()));
       const checkups = yearRecords.filter(r => r.type === 'Checkup').length;
       const vaccines = yearRecords.filter(r => r.type === 'Vaccine').length;
       const illnesses = yearRecords.filter(r => r.type === 'Illness').length;
       const medications = yearRecords.filter(r => r.type === 'Medication').length;
 
       const typeBreakdown = {};
-      live(m.records).forEach(r => {
+      m.records.forEach(r => {
         typeBreakdown[r.type] = (typeBreakdown[r.type] || 0) + 1;
       });
 
@@ -3629,7 +3121,7 @@
         <table>
           <tr><th>Record Type</th><th>Total Count</th></tr>
           ${breakdownRows}
-          <tr style="font-weight:bold;background:#ccfbf1;"><td>Total Records</td><td>${live(m.records).length}</td></tr>
+          <tr style="font-weight:bold;background:#ccfbf1;"><td>Total Records</td><td>${m.records.length}</td></tr>
         </table>
 
         <div class="goals">
@@ -3675,12 +3167,6 @@
               const origLedger = (origPolicy.ledger || []).find(x => x.id === l.id);
               for (let i = 0; i < (l.attachments || []).length; i++) {
                 l.attachments[i].data = await resolveAttachmentData(origLedger.attachments[i]);
-              }
-            }
-            for (const s of (p.surrenderRecords || [])) {
-              const origSurrender = (origPolicy.surrenderRecords || []).find(x => x.id === s.id);
-              for (let i = 0; i < (s.attachments || []).length; i++) {
-                s.attachments[i].data = await resolveAttachmentData(origSurrender.attachments[i]);
               }
             }
           }
@@ -3774,14 +3260,6 @@
     }
 
 
-    // Wraps an inflated member array with a marker saying whether this file is a
-    // full-family backup ('all') or a single-member export ('member'). Import
-    // uses this to decide whether it's safe to merge just one member's data in
-    // (member exports) or whether the whole family must be replaced (backups).
-    function buildExportEnvelope(inflatedMembers, exportType) {
-      return { fhsExportType: exportType, exportedAt: new Date().toISOString(), members: inflatedMembers };
-    }
-
     async function exportMember(encrypt, key, salt, iterVer) {
       if (!currentMemberId) {
         alert('Please select a member first');
@@ -3789,8 +3267,7 @@
       }
       const m = members.find(x => x.id === currentMemberId);
       const inflated = await inflateMembersForExport([m]);
-      const envelope = buildExportEnvelope(inflated, 'member');
-      const data = await buildExportPayload(JSON.stringify(envelope, null, 2), encrypt, key, salt, iterVer);
+      const data = await buildExportPayload(JSON.stringify(inflated, null, 2), encrypt, key, salt, iterVer);
       const blob = new Blob([data], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -3802,8 +3279,7 @@
 
     async function exportData(encrypt, key, salt, iterVer) {
       const inflated = await inflateMembersForExport(members);
-      const envelope = buildExportEnvelope(inflated, 'all');
-      const data = await buildExportPayload(JSON.stringify(envelope, null, 2), encrypt, key, salt, iterVer);
+      const data = await buildExportPayload(JSON.stringify(inflated, null, 2), encrypt, key, salt, iterVer);
       const blob = new Blob([data], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -3813,42 +3289,16 @@
       URL.revokeObjectURL(url);
     }
 
-    // Unwraps an imported file into { exportType, rawMembers }. New exports carry
-    // an explicit fhsExportType ('member' or 'all'); older exports made before
-    // this distinction existed are a bare array with no envelope, and are always
-    // treated as 'all' so their import behavior is unchanged (full replace) -
-    // there's no reliable way to tell an old single-member export from an old
-    // full backup of a one-person family, so we don't guess.
-    function parseImportEnvelope(parsed) {
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.members)) {
-        return { exportType: parsed.fhsExportType === 'member' ? 'member' : 'all', rawMembers: parsed.members };
-      }
-      if (Array.isArray(parsed)) {
-        return { exportType: 'all', rawMembers: parsed };
-      }
-      throw new Error('Expected a JSON array of family members, or a Family Health Shield export file.');
-    }
-
     // Validates and normalizes imported data so a malformed or foreign JSON
     // file can't crash rendering later (e.g. missing .records/.tags arrays).
     // Returns the normalized array, or throws with a human-readable reason.
     function normalizeImportedMembers(data) {
       if (!Array.isArray(data)) throw new Error('Expected a JSON array of family members.');
-      const normalized = data.map((raw, i) => {
+      return data.map((raw, i) => {
         if (!raw || typeof raw !== 'object') throw new Error(`Member #${i + 1} is not a valid object.`);
         if (!raw.name || typeof raw.name !== 'string') throw new Error(`Member #${i + 1} is missing a name.`);
         return {
           id: sanitizeId(raw.id, (Date.now() + i).toString()),
-          // Sync metadata (version/updatedAt/deletedAt/schemaVersion) is
-          // passed through as-is here rather than defaulted - the
-          // migrateSyncFields() call below (same function used for local
-          // data on load) backfills anything missing exactly the way
-          // design 2.6/2.8 wants: an old export file with no `version`
-          // field becomes version 1, not silently dropped and re-created
-          // fresh, which would break merge-by-id entirely.
-          version: raw.version, updatedAt: raw.updatedAt, deletedAt: raw.deletedAt, schemaVersion: raw.schemaVersion,
-          fieldVersion: (raw.fieldVersion && typeof raw.fieldVersion === 'object') ? raw.fieldVersion : undefined,
-          historyEntries: Array.isArray(raw.historyEntries) ? raw.historyEntries : undefined,
           name: raw.name,
           nameZh: raw.nameZh || '',
           nameZhAvatarIdx: parseInt(raw.nameZhAvatarIdx) || 1,
@@ -3862,7 +3312,6 @@
           bloodTypeAttachment: (raw.bloodTypeAttachment && typeof raw.bloodTypeAttachment === 'object') ? raw.bloodTypeAttachment : null,
           customReminders: Array.isArray(raw.customReminders) ? raw.customReminders.map((cr, j) => ({
             id: sanitizeId(cr.id, freshId('cr')),
-            version: cr.version, updatedAt: cr.updatedAt, deletedAt: cr.deletedAt, schemaVersion: cr.schemaVersion,
             title: cr.title || 'Reminder',
             dueDate: cr.dueDate || new Date().toISOString().slice(0, 10),
             repeatMonths: parseInt(cr.repeatMonths) || 0,
@@ -3870,7 +3319,6 @@
           })) : [],
           records: Array.isArray(raw.records) ? raw.records.map(r => ({
             id: sanitizeId(r.id, freshId('r')),
-            version: r.version, updatedAt: r.updatedAt, deletedAt: r.deletedAt, schemaVersion: r.schemaVersion,
             date: r.date || new Date().toISOString().slice(0, 10),
             type: r.type || 'Checkup',
             title: r.title || r.type || 'Record',
@@ -3883,19 +3331,12 @@
           // sumInsuredHistory entries, riders, ledger rows, claims,
           // surrenderRecords, attachments) in place - see its comment above
           // for why this is a deep walk rather than a field-by-field remap.
-          // It preserves every OTHER field untouched, including sync
-          // metadata, so insurance data doesn't need the same manual
-          // pass-through as member/record/reminder fields above.
           insurance: (raw.insurance && typeof raw.insurance === 'object') ? {
             policies: sanitizeIdsDeep(Array.isArray(raw.insurance.policies) ? raw.insurance.policies : []),
             claims: sanitizeIdsDeep(Array.isArray(raw.insurance.claims) ? raw.insurance.claims : [])
           } : { policies: [], claims: [] }
         };
       });
-      // Backfill anything missing (old export files, or fields normalize
-      // above didn't touch) the exact same way local data gets migrated on
-      // load - see design 2.6.
-      return migrateSyncFields(normalized);
     }
 
     async function migrateMemberAttachmentsToIdb(memberList) {
@@ -3919,275 +3360,10 @@
                 l.attachments = await persistAttachmentsToIdb(l.attachments);
               }
             }
-            for (const s of (p.surrenderRecords || [])) {
-              if (s.attachments && s.attachments.length) {
-                s.attachments = await persistAttachmentsToIdb(s.attachments);
-              }
-            }
           }
         }
       }
       return memberList;
-    }
-
-    // Merges a single-member export into the existing family, matched by id -
-    // unlike a full backup import, this never replaces the whole `members`
-    // array, so every OTHER family member is left completely untouched. A
-    // matching id updates that member in place; no match (e.g. re-importing
-    // onto a fresh device, or someone renamed/lost their original) offers to
-    // add them as a new member instead of silently discarding the file.
-    // ========== CONFLICT QUEUE (build order step 5 builds the UI on top
-    // of this; step 4 just needs to capture and persist what mergeMembers()
-    // finds, per design 1.4 - "the queue is derived state, not a synced
-    // entity" - so it lives in its own storage key, separate from
-    // `members`/STORAGE_KEY, and is never exported/imported/synced itself) ==========
-    const CONFLICT_STORAGE_KEY = 'family_health_tracker_v3_conflicts';
-
-    function loadConflictQueue() {
-      try {
-        const raw = localStorage.getItem(CONFLICT_STORAGE_KEY);
-        return raw ? JSON.parse(raw) : [];
-      } catch (e) { return []; }
-    }
-    function saveConflictQueue(queue) {
-      try { localStorage.setItem(CONFLICT_STORAGE_KEY, JSON.stringify(queue)); return true; }
-      catch (e) { return false; }
-    }
-    // Deterministic key per design 1.3/1.4 - (entityId, baseVersion[, field]).
-    // Two independent merges (or two chained ones - see MERGE_SYNC_DESIGN.md
-    // 2.4's note on re-derived conflicts) that find "the same" disagreement
-    // produce the same key, so appending must dedupe on this rather than
-    // push raw, or the same conflict could appear more than once.
-    function conflictKey(c) {
-      return JSON.stringify([c.entityId, c.field || null, c.baseVersion]);
-    }
-    // Appends new conflicts (deduped) for one member's merge, tagged with
-    // enough context for a future queue UI to render without re-deriving
-    // anything. Returns how many were genuinely new (not already queued).
-    function appendConflicts(memberId, memberName, newConflicts) {
-      if (!newConflicts || !newConflicts.length) return 0;
-      const queue = loadConflictQueue();
-      const existingKeys = new Set(queue.map(conflictKey));
-      let added = 0;
-      newConflicts.forEach(c => {
-        const key = conflictKey(c);
-        if (existingKeys.has(key)) return;
-        queue.push(Object.assign({ memberId, memberName, detectedAt: nowIso() }, c));
-        existingKeys.add(key);
-        added++;
-      });
-      if (added) saveConflictQueue(queue);
-      return added;
-    }
-
-    // Locates the CURRENT live entity a queued conflict refers to, by
-    // walking conflict.path against the live `members` array. Paths look
-    // like [memberId, 'records', recordId] or, for nested insurance data,
-    // [memberId, 'insurance', 'policies', policyId, 'coverages', coverageId,
-    // 'sumInsuredHistory', historyId] - 'insurance' is a plain nested
-    // object (no id of its own), everything else is an array keyed by id,
-    // so this walks token-by-token rather than assuming strict key/id
-    // pairing the whole way. Returns null if anything in the chain no
-    // longer exists (member/entity deleted or never matched - the conflict
-    // is stale either way and the caller should drop it).
-    function resolveConflictEntity(conflict) {
-      const m = members.find(x => x.id === conflict.memberId);
-      if (!m) return null;
-      if (conflict.field) return { kind: 'field', member: m };
-
-      const path = conflict.path || [];
-      let node = m;
-      let i = 1;
-      while (i < path.length) {
-        const key = path[i];
-        const val = node[key];
-        if (Array.isArray(val)) {
-          const id = path[i + 1];
-          const foundIdx = val.findIndex(x => x.id === id);
-          if (foundIdx === -1) return null;
-          if (i + 2 >= path.length) {
-            return { kind: 'array', containerKey: key, arr: val, idx: foundIdx, entity: val[foundIdx] };
-          }
-          node = val[foundIdx];
-          i += 2;
-        } else if (val && typeof val === 'object') {
-          node = val; // plain nested object (e.g. 'insurance') - no id to consume
-          i += 1;
-        } else {
-          return null; // malformed/unrecognized path
-        }
-      }
-      return null;
-    }
-
-    // Container types whose entities have nested syncable children that
-    // are ALREADY correctly merged into the live entity (attachments,
-    // sumInsuredHistory, ledger/coverages/riders/surrenderRecords under a
-    // policy) - a "keep remote"/"keep both" resolution must only touch the
-    // scalar fields actually in dispute for these, never blindly overwrite
-    // the whole object, or it would discard that already-merged child data.
-    // Sourced from FHSMerge's own exported key lists so this can't drift
-    // from what the merge engine actually used to detect the conflict.
-    // Types with no entry here (riders, sumInsuredHistory, historyEntries)
-    // have no nested children, so a full-object apply is safe for them.
-    const CONTAINER_SCALAR_KEYS = {
-      records: FHSMerge.RECORD_SCALAR_KEYS,
-      customReminders: FHSMerge.REMINDER_SCALAR_KEYS,
-      ledger: FHSMerge.LEDGER_SCALAR_KEYS,
-      coverages: FHSMerge.COVERAGE_SCALAR_KEYS,
-      surrenderRecords: FHSMerge.SURRENDER_SCALAR_KEYS,
-      claims: FHSMerge.CLAIM_SCALAR_KEYS,
-      policies: FHSMerge.POLICY_SCALAR_KEYS
-    };
-
-    // Applies a resolution choice and removes the conflict from the queue.
-    // 'local'  - content already showing (conflict-output contract) - just
-    //            bump version so this exact tie won't be re-flagged later.
-    // 'remote' - apply remote's disputed fields (only those, for container
-    //            types - see CONTAINER_SCALAR_KEYS above), then bump.
-    // 'both'   - (array-item conflicts only) duplicate remote's full entity
-    //            under a fresh id via deepCloneAndRemapIds, insert next to
-    //            the original, and still bump the original to settle it.
-    function resolveConflict(conflict, choice) {
-      const resolved = resolveConflictEntity(conflict);
-      if (!resolved) { removeConflictFromQueue(conflict); return; } // already gone (e.g. deleted since) - just drop it
-
-      if (resolved.kind === 'field') {
-        const m = resolved.member;
-        if (choice === 'remote') m[conflict.field] = conflict.remote;
-        if (!m.fieldVersion) m.fieldVersion = freshFieldVersions();
-        m.fieldVersion[conflict.field] = (m.fieldVersion[conflict.field] || 1) + 1;
-        bumpVersion(m);
-      } else {
-        const { entity, arr, idx, containerKey } = resolved;
-        if (choice === 'remote') {
-          const scalarKeys = CONTAINER_SCALAR_KEYS[containerKey];
-          if (scalarKeys) {
-            scalarKeys.forEach(k => { entity[k] = conflict.remote[k]; });
-          } else {
-            const id = entity.id;
-            Object.assign(entity, conflict.remote, { id });
-          }
-          bumpVersion(entity);
-        } else if (choice === 'both') {
-          const dup = deepCloneAndRemapIds(conflict.remote);
-          Object.assign(dup, freshSyncMeta());
-          arr.splice(idx + 1, 0, dup);
-          bumpVersion(entity); // settles the original's side of the tie too
-        } else {
-          bumpVersion(entity); // 'local' - content unchanged, just settle
-        }
-      }
-
-      saveData();
-      removeConflictFromQueue(conflict);
-    }
-
-    function removeConflictFromQueue(conflict) {
-      const queue = loadConflictQueue();
-      const key = conflictKey(conflict);
-      const next = queue.filter(c => conflictKey(c) !== key);
-      saveConflictQueue(next);
-    }
-
-    // Prunes the persisted queue per design 1.6/1.7: an entry is dropped
-    // (not shown) once the local entity's version has moved past its
-    // baseVersion (already resolved - by this device or a synced-in
-    // resolution from elsewhere), once the entity/member no longer exists,
-    // or once any ancestor in its chain is now tombstoned (cascade
-    // suppression - a conflict under a deleted policy is meaningless to
-    // show). Persists the pruned result so stale entries don't keep
-    // reappearing on every call. Returns the list that should actually render.
-    function getActiveConflicts() {
-      const queue = loadConflictQueue();
-      const active = [];
-      let changed = false;
-      queue.forEach(c => {
-        const resolved = resolveConflictEntity(c);
-        if (!resolved) { changed = true; return; } // dropped: gone entirely
-
-        if (resolved.kind === 'field') {
-          const currentVersion = (resolved.member.fieldVersion || {})[c.field] || 1;
-          if (currentVersion > c.baseVersion) { changed = true; return; } // already resolved elsewhere
-          active.push(c);
-        } else {
-          if (resolved.entity.version > c.baseVersion) { changed = true; return; }
-          // cascade suppression: walk the path's intermediate array-items
-          // for a tombstone (the member itself is checked separately -
-          // a tombstoned member's conflicts are equally meaningless).
-          if (resolved.member && resolved.member.deletedAt) { changed = true; return; }
-          const path = c.path || [];
-          let node = members.find(x => x.id === c.memberId);
-          let ancestorDeleted = false;
-          let i = 1;
-          while (node && i < path.length) {
-            const key = path[i];
-            const val = node[key];
-            if (Array.isArray(val)) {
-              const id = path[i + 1];
-              const item = val.find(x => x.id === id);
-              if (!item) break;
-              if (item.id !== c.entityId && item.deletedAt) { ancestorDeleted = true; break; }
-              node = item; i += 2;
-            } else if (val && typeof val === 'object') {
-              node = val; i += 1;
-            } else break;
-          }
-          if (ancestorDeleted) { changed = true; return; }
-          active.push(c);
-        }
-      });
-      if (changed) saveConflictQueue(active);
-      return active;
-    }
-
-    async function mergeImportedMembers(normalized) {
-      let totalNewConflicts = 0;
-      for (const incoming of normalized) {
-        const idx = members.findIndex(x => x.id === incoming.id);
-        const isUpdate = idx !== -1;
-        const label = isUpdate
-          ? `Update "${incoming.name}" using this file?\n\nThis merges that member's records, insurance, etc. field-by-field with the imported version - your own edits since the last sync aren't overwritten. Other family members are not affected.`
-          : `"${incoming.name}" doesn't match any current family member.\n\nAdd them as a new member from this file?`;
-        if (!confirm(label)) continue;
-        const previousMembers = members;
-
-        let finalMember, conflicts = [];
-        if (isUpdate) {
-          // FHSMerge.mergeMembers (merge-engine.js, loaded as its own
-          // namespaced global - see that file's header comment for why)
-          // is pure - it doesn't touch `members` or IndexedDB itself, just
-          // returns the merged result plus whatever conflicts it found.
-          const result = FHSMerge.mergeMembers([members[idx]], [incoming]);
-          finalMember = result.members[0];
-          conflicts = result.conflicts;
-        } else {
-          finalMember = incoming; // nothing local to merge against
-        }
-
-        const [migrated] = await migrateMemberAttachmentsToIdb([finalMember]);
-        const nextMembers = [...members];
-        if (isUpdate) nextMembers[idx] = migrated; else nextMembers.push(migrated);
-        members = nextMembers;
-        if (!saveData()) {
-          members = previousMembers;
-          alert(`Couldn't save the imported data for "${incoming.name}" - storage may be full.`);
-          continue;
-        }
-        totalNewConflicts += appendConflicts(migrated.id, migrated.name, conflicts);
-        currentMemberId = migrated.id;
-        currentTab = 'overview';
-      }
-      renderMemberList();
-      renderMain();
-      updateConflictBadge();
-      if (totalNewConflicts > 0) {
-        // Nothing was lost - the other side's version is saved in the
-        // queue for review (conflict-output contract, design 1.5). The
-        // ⚠️ Conflicts button in the header (now visible) opens the
-        // review screen built in build order step 5.
-        alert(`Import merged. ${totalNewConflicts} item(s) had edits on both sides for the same thing - your device's version was kept for now. Click "⚠️ Conflicts" in the header to review and resolve them.`);
-      }
     }
 
     async function extractJsonFromZip(file) {
@@ -4232,28 +3408,16 @@
           }
         }
 
-        let envelope;
-        try {
-          envelope = parseImportEnvelope(parsed);
-        } catch(err) {
-          alert('Invalid file format: ' + err.message);
-          e.target.value = '';
-          return;
-        }
-
         let normalized;
         try {
-          normalized = normalizeImportedMembers(envelope.rawMembers);
+          normalized = normalizeImportedMembers(parsed);
         } catch(err) {
           alert('Invalid file format: ' + err.message);
           e.target.value = '';
           return;
         }
 
-        if (envelope.exportType === 'member') {
-          // Single-member export: merge in by id, touching only that member.
-          await mergeImportedMembers(normalized);
-        } else if (confirm(`Import will replace current ${members.length} members with ${normalized.length} imported member(s). Continue?`)) {
+        if (confirm(`Import will replace current ${members.length} members with ${normalized.length} imported member(s). Continue?`)) {
           const previousMembers = members;
           normalized = await migrateMemberAttachmentsToIdb(normalized);
           members = normalized;
@@ -4335,8 +3499,7 @@
       zip.file('family_health_and_shield.html', htmlContent);
 
       const inflated = await inflateMembersForExport(members);
-      const envelope = buildExportEnvelope(inflated, 'all');
-      const backupJson = await buildExportPayload(JSON.stringify(envelope, null, 2), encrypt, key, salt, iterVer);
+      const backupJson = await buildExportPayload(JSON.stringify(inflated, null, 2), encrypt, key, salt, iterVer);
       zip.file(`backup/family_health_backup${encrypt ? '_encrypted' : ''}.json`, backupJson);
 
       zip.folder('attachments');
@@ -4375,11 +3538,6 @@
           }
           for (const l of (p.ledger || [])) {
             for (const att of (l.attachments || [])) {
-              if (await writeAttachmentIntoZip(att)) embeddedCount++; else missingCount++;
-            }
-          }
-          for (const s of (p.surrenderRecords || [])) {
-            for (const att of (s.attachments || [])) {
               if (await writeAttachmentIntoZip(att)) embeddedCount++; else missingCount++;
             }
           }
@@ -4436,7 +3594,6 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     let insTempCoverages = [];
     let insTempAttachments = [];
     let insTempLedgerAttachments = [];
-    let insTempSurrenderAttachments = [];
     let insCurrentLedgerPolicyId = null;
     let insCurrentSurrenderPolicyId = null;
     let insCurrentSumHistoryPolicyId = null;
@@ -4500,7 +3657,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
 
     function insAnnualPremium(m) {
       const mult = { Monthly: 12, Quarterly: 4, Yearly: 1, Single: 0 };
-      return live(m.insurance.policies).filter(p => p.status !== 'Discontinued').reduce((sum, p) => sum + (Number(p.premium)||0) * (mult[p.frequency] ?? 1), 0);
+      return m.insurance.policies.filter(p => p.status !== 'Discontinued').reduce((sum, p) => sum + (Number(p.premium)||0) * (mult[p.frequency] ?? 1), 0);
     }
 
     const INS_TYPE_DISPLAY_OVERRIDES = { 'Home': 'Home/Fire', 'Accident': 'Personal Accident' };
@@ -4514,9 +3671,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     }
 
     function insEffectiveSumInsured(c) {
-      const liveHistory = live(c.sumInsuredHistory || []);
-      if (c.reducing && liveHistory.length) {
-        const latest = [...liveHistory].sort((a,b) => new Date(b.date) - new Date(a.date))[0];
+      if (c.reducing && c.sumInsuredHistory && c.sumInsuredHistory.length) {
+        const latest = [...c.sumInsuredHistory].sort((a,b) => new Date(b.date) - new Date(a.date))[0];
         return Number(latest.amount) || 0;
       }
       return Number(c.sumInsured) || 0;
@@ -4546,7 +3702,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
 
     function insGenerateReminders(m) {
       const reminders = [];
-      m.insurance.policies.filter(p => p.status !== 'Discontinued' && !p.deletedAt).forEach(p => {
+      m.insurance.policies.filter(p => p.status !== 'Discontinued').forEach(p => {
         const d = insDaysUntil(p.expiry);
         if (d !== null) {
           reminders.push({
@@ -4595,7 +3751,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       return m.insurance.claims.filter(c => c.policyId === policyId && c.coverageId === coverageId).reduce((s,c) => s + (Number(c.amountPaid)||0), 0);
     }
     function insLatestSurrenderTotal(p) {
-      const recs = live(p.surrenderRecords || []);
+      const recs = p.surrenderRecords || [];
       if (!recs.length) return null;
       const latest = [...recs].sort((a,b) => new Date(b.date) - new Date(a.date))[0];
       return insSurrenderRecordTotal(latest);
@@ -4642,8 +3798,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
 
     function insRenderOverview(m, reminders) {
       const upcoming = reminders.filter(r => r.status !== 'ok').length;
-      const totalClaims = live(m.insurance.claims).length;
-      const activePolicies = live(m.insurance.policies).filter(p => p.status !== 'Discontinued');
+      const totalClaims = m.insurance.claims.length;
+      const activePolicies = m.insurance.policies.filter(p => p.status !== 'Discontinued');
 
       const insuredByType = {};
       const assetByType = {};
@@ -4731,7 +3887,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     }
 
     function insRenderPolicies(m) {
-      const active = live(m.insurance.policies).filter(p => p.status !== 'Discontinued');
+      const active = m.insurance.policies.filter(p => p.status !== 'Discontinued');
       return `
         <div class="card">
           <div class="card-title">📄 Policies</div>
@@ -4741,7 +3897,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     }
 
     function insRenderDiscontinued(m) {
-      const discontinued = live(m.insurance.policies).filter(p => p.status === 'Discontinued');
+      const discontinued = m.insurance.policies.filter(p => p.status === 'Discontinued');
       return `
         <div class="card">
           <div class="card-title">🚫 Discontinued / Terminated Policies</div>
@@ -4756,7 +3912,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       const tagClass = d === null ? 'tag-gray' : d < 0 ? 'tag-red' : d <= 30 ? 'tag-yellow' : 'tag-green';
       const tagText = d === null ? 'No expiry set' : d < 0 ? `Overdue ${Math.abs(d)}d` : d === 0 ? 'Due today' : `Due in ${d}d`;
       const surrenderTotal = insLatestSurrenderTotal(p);
-      const coverages = live(p.coverages || []);
+      const coverages = p.coverages || [];
       const payout = p.payout && p.payout.startYear ? insNextPayoutInfo(p) : null;
       return `
         <div class="policy-card">
@@ -4782,9 +3938,9 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
           ${coverages.length ? `<div class="s-097e6af4">${coverages.map(c => insRenderCoverageSummary(m, p, c)).join('')}</div>` : '<p class="s-e1b40251">No coverage details added yet — click ✏️ to add.</p>'}
           ${payout ? `<div class="s-406b76fd">🎉 Cashback benefit: ${p.payout.percent}% of ${insFmtMoney(p.payout.baseAmount)} · next payout ~${insFmtMoney(payout.amount)} on ${escapeHtml(payout.date)}</div>` : ''}
           ${p.premiumPaidByBonus ? `<div class="s-e6bec453">💰 Premium currently paid via Accumulated Cash Bonus${p.premiumPaidByBonusSince ? ' · since ' + escapeHtml(p.premiumPaidByBonusSince) : ''}</div>` : ''}
-          ${(() => { const liveAtts = live(p.attachments || []); return liveAtts.length ? `<div class="s-eae4831c">${liveAtts.map((att, idx) => `<span class="tag tag-gray s-58aba575" data-ins-open-attachment="${escapeHtml(p.id)}" data-ins-att-idx="${idx}">${att.type === 'image' ? '🖼️' : '📄'} ${escapeHtml(att.name)}</span>`).join('')}</div>` : ''; })()}
+          ${(p.attachments && p.attachments.length) ? `<div class="s-eae4831c">${p.attachments.map((att, idx) => `<span class="tag tag-gray s-58aba575" data-ins-open-attachment="${escapeHtml(p.id)}" data-ins-att-idx="${idx}">${att.type === 'image' ? '🖼️' : '📄'} ${escapeHtml(att.name)}</span>`).join('')}</div>` : ''}
           ${p.notes ? `<div class="s-ca2edd98">${escapeHtml(p.notes)}</div>` : ''}
-          ${(() => { const liveRiders = live(p.riders || []); return liveRiders.length ? `<div class="s-eae4831c">${liveRiders.map(r => {
+          ${(p.riders && p.riders.length) ? `<div class="s-eae4831c">${p.riders.map(r => {
             const rd = insDaysUntil(r.dueDate);
             const isExpired = rd !== null && rd < 0;
             const rc = rd === null ? 'tag-gray' : isExpired ? 'tag-red' : rd <= 30 ? 'tag-yellow' : 'tag-green';
@@ -4793,9 +3949,9 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
               ? `${escapeHtml(r.description)} · Expired ${escapeHtml(r.dueDate||'')}`
               : `${escapeHtml(r.description)}${r.dueDate ? ' · ' + escapeHtml(r.dueDate) : ''}`;
             return `<span class="tag ${rc}" title="${isExpired ? 'Expired on' : 'Due'} ${escapeHtml(r.dueDate||'--')}">${icon} ${label}</span>`;
-          }).join('')}</div>` : ''; })()}
+          }).join('')}</div>` : ''}
           <div class="s-79744520">
-            <button class="btn btn-secondary btn-sm" data-ins-open-ledger="${escapeHtml(p.id)}">📒 Ledger (${live(p.ledger||[]).length})</button>
+            <button class="btn btn-secondary btn-sm" data-ins-open-ledger="${escapeHtml(p.id)}">📒 Ledger (${(p.ledger||[]).length})</button>
             ${surrenderTotal ? `<button class="btn btn-secondary btn-sm" data-ins-open-surrender="${escapeHtml(p.id)}">💰 Surrender Value: ${insFmtMoney(surrenderTotal)}</button>` : `<span data-ins-open-surrender="${escapeHtml(p.id)}" class="s-41b07b38">+ Track Surrender Value</span>`}
             <button class="btn btn-secondary btn-sm" data-ins-open-report="${escapeHtml(p.id)}">🖨️ View / Print</button>
           </div>
@@ -4822,7 +3978,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
             ${c.annualLimit ? `<div><div class="policy-field-label">Annual Limit</div><div class="policy-field-value">${insFmtMoney(c.annualLimit)}</div></div>` : ''}
             ${c.lifetimeLimit ? `<div><div class="policy-field-label">Lifetime Limit Remaining</div><div class="policy-field-value">${insFmtMoney(remainingLifetime)} <span class="s-5594ca44">/ ${insFmtMoney(c.lifetimeLimit)}</span></div></div>` : ''}
           </div>` : ''}
-          ${c.reducing ? `<div class="s-d79ce2bc"><span data-ins-open-sumhistory="${escapeHtml(p.id)}" data-ins-cov-id="${escapeHtml(c.id)}" class="s-c0623ab3">📉 View / Update Sum Insured History (${live(c.sumInsuredHistory||[]).length})</span></div>` : ''}
+          ${c.reducing ? `<div class="s-d79ce2bc"><span data-ins-open-sumhistory="${escapeHtml(p.id)}" data-ins-cov-id="${escapeHtml(c.id)}" class="s-c0623ab3">📉 View / Update Sum Insured History (${(c.sumInsuredHistory||[]).length})</span></div>` : ''}
         </div>
       `;
     }
@@ -4831,7 +3987,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       return `
         <div class="card">
           <div class="card-title">🧾 Claims</div>
-          ${live(m.insurance.claims).length ? live(m.insurance.claims).map(c => insRenderClaimCard(m, c)).join('') : '<p class="s-51f2817c">No claims filed yet.</p>'}
+          ${m.insurance.claims.length ? m.insurance.claims.map(c => insRenderClaimCard(m, c)).join('') : '<p class="s-51f2817c">No claims filed yet.</p>'}
         </div>
       `;
     }
@@ -4885,14 +4041,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         e.stopPropagation();
         if (!confirm('Delete this policy?')) return;
         const mm = members.find(x => x.id === currentMemberId);
-        const p = mm.insurance.policies.find(x => x.id === el.dataset.insDeletePolicy);
-        if (p) tombstone(p);
-        // Claims aren't nested under their policy in the data model (linked
-        // via policyId, not containment), so tombstone dominance can't be
-        // derived from an ancestor chain here - explicitly tombstone each
-        // affected claim too, mirroring the cascade the old physical-delete
-        // code did.
-        (mm.insurance.claims || []).filter(c => c.policyId === el.dataset.insDeletePolicy).forEach(tombstone);
+        mm.insurance.policies = mm.insurance.policies.filter(p => p.id !== el.dataset.insDeletePolicy);
+        mm.insurance.claims = mm.insurance.claims.filter(c => c.policyId !== el.dataset.insDeletePolicy);
         saveData(); renderMain();
       }));
       document.querySelectorAll('[data-ins-reactivate-policy]').forEach(el => el.addEventListener('click', (e) => {
@@ -4900,7 +4050,6 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         const mm = members.find(x => x.id === currentMemberId);
         const p = mm.insurance.policies.find(x => x.id === el.dataset.insReactivatePolicy);
         p.status = 'Active';
-        bumpVersion(p);
         saveData(); renderMain();
       }));
       document.querySelectorAll('[data-ins-open-ledger]').forEach(el => el.addEventListener('click', (e) => { e.stopPropagation(); insOpenLedgerModal(el.dataset.insOpenLedger); }));
@@ -4909,7 +4058,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       document.querySelectorAll('[data-ins-open-attachment]').forEach(el => el.addEventListener('click', (e) => {
         e.stopPropagation();
         const p = m.insurance.policies.find(x => x.id === el.dataset.insOpenAttachment);
-        const att = p ? live(p.attachments || [])[parseInt(el.dataset.insAttIdx)] : null;
+        const att = p && p.attachments ? p.attachments[parseInt(el.dataset.insAttIdx)] : null;
         openAttachment(att);
       }));
       document.querySelectorAll('[data-ins-open-sumhistory]').forEach(el => el.addEventListener('click', (e) => { e.stopPropagation(); insOpenSumHistoryModal(el.dataset.insOpenSumhistory, el.dataset.insCovId); }));
@@ -4918,8 +4067,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         e.stopPropagation();
         if (!confirm('Delete this claim?')) return;
         const mm = members.find(x => x.id === currentMemberId);
-        const c = mm.insurance.claims.find(x => x.id === el.dataset.insDeleteClaim);
-        if (c) tombstone(c);
+        mm.insurance.claims = mm.insurance.claims.filter(c => c.id !== el.dataset.insDeleteClaim);
         saveData(); renderMain();
       }));
     }
@@ -4953,9 +4101,9 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       document.getElementById('insPBonusPaidEnabled').checked = bonusPaidEnabled;
       document.getElementById('insBonusPaidFields').style.display = bonusPaidEnabled ? 'block' : 'none';
       document.getElementById('insPBonusPaidSince').value = bonusPaidEnabled ? (p.premiumPaidByBonusSince || '') : '';
-      insTempRiders = p && p.riders ? JSON.parse(JSON.stringify(live(p.riders))) : [];
-      insTempCoverages = p && p.coverages && live(p.coverages).length ? JSON.parse(JSON.stringify(live(p.coverages))) : [{ id: insUid(), type: 'Life', sumInsured: '', lifetimeLimit: '', annualLimit: '', reducing: false, expiry: '' }];
-      insTempAttachments = p && p.attachments ? live(p.attachments).map(a => ({ ...a })) : [];
+      insTempRiders = p && p.riders ? JSON.parse(JSON.stringify(p.riders)) : [];
+      insTempCoverages = p && p.coverages && p.coverages.length ? JSON.parse(JSON.stringify(p.coverages)) : [{ id: insUid(), type: 'Life', sumInsured: '', lifetimeLimit: '', annualLimit: '', reducing: false, expiry: '' }];
+      insTempAttachments = p && p.attachments ? p.attachments.map(a => ({ ...a })) : [];
       insRenderRidersRows();
       insRenderCoverageRows();
       insRenderAttachmentPreview();
@@ -5127,22 +4275,9 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
           sumInsuredHistory: c.sumInsuredHistory || []
         }));
       if (!cleanCoverages.length) { alert('Add at least one coverage with a sum insured (or limits for medical cover)'); return; }
-      const existingPolicy = insEditingPolicyId ? m.insurance.policies.find(x => x.id === insEditingPolicyId) : null;
-      const newRiders = insTempRiders.filter(r => r.description || r.dueDate);
-      // Coverages/riders are edited via a temp array and the whole array is
-      // rebuilt on every save (not saved field-by-field like member scalars),
-      // so version/deletedAt carry-forward + diff-before-bump (and turning a
-      // removed-from-the-form item into a tombstone instead of letting it
-      // vanish) has to happen here rather than at individual field-edit time.
-      // See syncStampSubEntities - note it returns a NEW array (it may be
-      // longer than what was passed in, since removed-but-not-yet-tombstoned
-      // items get added back as tombstones), so the results replace
-      // cleanCoverages/newRiders rather than being used in place.
-      const finalCoverages = syncStampSubEntities(existingPolicy ? existingPolicy.coverages : [], cleanCoverages);
-      const finalRiders = syncStampSubEntities(existingPolicy ? existingPolicy.riders : [], newRiders);
       const payoutEnabled = document.getElementById('insPPayoutEnabled').checked;
       const bonusPaidEnabled = document.getElementById('insPBonusPaidEnabled').checked;
-      const savedAttachments = syncStampAttachments(existingPolicy ? existingPolicy.attachments : [], await persistAttachmentsToIdb(insTempAttachments));
+      const savedAttachments = await persistAttachmentsToIdb(insTempAttachments);
       const data = {
         status: document.getElementById('insPStatus').value,
         provider: document.getElementById('insPProvider').value.trim(),
@@ -5152,8 +4287,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         start: document.getElementById('insPStart').value,
         expiry: document.getElementById('insPExpiry').value,
         notes: document.getElementById('insPNotes').value.trim(),
-        coverages: finalCoverages,
-        riders: finalRiders,
+        coverages: cleanCoverages,
+        riders: insTempRiders.filter(r => r.description || r.dueDate),
         attachments: savedAttachments,
         payout: payoutEnabled ? {
           startYear: document.getElementById('insPPayoutStartYear').value,
@@ -5163,11 +4298,11 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         premiumPaidByBonus: bonusPaidEnabled,
         premiumPaidByBonusSince: bonusPaidEnabled ? document.getElementById('insPBonusPaidSince').value : ''
       };
-      if (existingPolicy) {
-        Object.assign(existingPolicy, data);
-        bumpVersion(existingPolicy);
+      if (insEditingPolicyId) {
+        const p = m.insurance.policies.find(x => x.id === insEditingPolicyId);
+        Object.assign(p, data);
       } else {
-        m.insurance.policies.push(Object.assign({ id: insUid(), ledger: [], surrenderRecords: [] }, data, freshSyncMeta()));
+        m.insurance.policies.push(Object.assign({ id: insUid(), ledger: [], surrenderRecords: [] }, data));
       }
       saveData();
       document.getElementById('insPolicyModal').classList.remove('active');
@@ -5217,19 +4352,17 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
           <div class="stat-box"><div class="stat-value s-e2151554">${insFmtMoney(totalPremium)}</div><div class="stat-label">Total Premium Paid</div></div>
           <div class="stat-box"><div class="stat-value s-e2151554">${insFmtMoney(totalPayout)}</div><div class="stat-label">Total Payout Received</div></div>
         </div>`;
-      const entries = live(p.ledger).sort((a,b) => new Date(b.date) - new Date(a.date));
+      const entries = [...(p.ledger||[])].sort((a,b) => new Date(b.date) - new Date(a.date));
       if (!entries.length) {
         container.innerHTML = '<p class="s-51f2817c">No payment transactions recorded yet.</p>';
         return;
       }
-      container.innerHTML = entries.map(l => {
-        const liveAtts = live(l.attachments || []);
-        return `
+      container.innerHTML = entries.map(l => `
         <div class="s-952fb81a s-ledger-row" data-ledger-row-id="${escapeHtml(l.id)}">
           <div>
             <div class="s-ea8a0de7">${l.type === 'payout' ? '💰' : '💸'} ${escapeHtml(l.date||'--')} <span class="s-5ea608c5">· ${escapeHtml(l.method||'--')}</span></div>
             ${l.notes ? `<div class="s-c16bedce">${escapeHtml(l.notes)}</div>` : ''}
-            ${liveAtts.length ? `<div class="s-bb680ec5">${liveAtts.map((att, idx) => `<span data-ins-open-ledger-att="${escapeHtml(l.id)}" data-ins-att-idx="${idx}" class="s-cd942964">${att.type === 'image' ? '🖼️' : '📄'} ${escapeHtml(att.name)}</span>`).join('')}</div>` : ''}
+            ${(l.attachments && l.attachments.length) ? `<div class="s-bb680ec5">${l.attachments.map((att, idx) => `<span data-ins-open-ledger-att="${escapeHtml(l.id)}" data-ins-att-idx="${idx}" class="s-cd942964">${att.type === 'image' ? '🖼️' : '📄'} ${escapeHtml(att.name)}</span>`).join('')}</div>` : ''}
           </div>
           <div class="s-3b6fff87">
             <div class="${l.type === 'payout' ? 's-ledger-payout' : 's-ledger-expense'}">${l.type === 'payout' ? '+' : ''}${insFmtMoney(l.amount)}</div>
@@ -5237,11 +4370,10 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
             <span data-ins-remove-ledger="${escapeHtml(l.id)}" class="s-abe8a067">🗑️</span>
           </div>
         </div>
-      `;
-      }).join('');
+      `).join('');
       container.querySelectorAll('[data-ins-open-ledger-att]').forEach(el => el.addEventListener('click', () => {
         const l = p.ledger.find(x => x.id === el.dataset.insOpenLedgerAtt);
-        const att = l ? live(l.attachments || [])[parseInt(el.dataset.insAttIdx)] : null;
+        const att = l && l.attachments ? l.attachments[parseInt(el.dataset.insAttIdx)] : null;
         openAttachment(att);
       }));
       container.querySelectorAll('[data-ins-edit-ledger]').forEach(el => el.addEventListener('click', () => {
@@ -5256,7 +4388,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         document.getElementById('insLNotes').value = l.notes || '';
         document.getElementById('insBtnAddLedgerEntry').textContent = 'Update Transaction';
         document.getElementById('insBtnCancelLedgerEdit').style.display = 'inline-block';
-        insTempLedgerAttachments = l.attachments ? live(l.attachments).map(a => ({ ...a })) : [];
+        insTempLedgerAttachments = l.attachments ? l.attachments.map(a => ({ ...a })) : [];
         insRenderLedgerAttachmentPreview();
         // The edit form lives above the ledger list, so without this the user has to
         // manually scroll up to find it -- especially painful with a long transaction list.
@@ -5266,8 +4398,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         if (!confirm('Delete this transaction? This cannot be undone.')) return;
         const m = members.find(x => x.id === currentMemberId);
         const p = m.insurance.policies.find(x => x.id === insCurrentLedgerPolicyId);
-        const l = p.ledger.find(x => x.id === el.dataset.insRemoveLedger);
-        if (l) tombstone(l);
+        p.ledger = p.ledger.filter(x => x.id !== el.dataset.insRemoveLedger);
         saveData();
         if (insEditingLedgerId === el.dataset.insRemoveLedger) insResetLedgerForm();
         insRenderLedgerList(p); renderMain();
@@ -5281,23 +4412,20 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       const m = members.find(x => x.id === currentMemberId);
       const p = m.insurance.policies.find(x => x.id === insCurrentLedgerPolicyId);
       if (!p.ledger) p.ledger = [];
-      const priorLedgerEntry = insEditingLedgerId ? p.ledger.find(x => x.id === insEditingLedgerId) : null;
-      const persistedLedgerAtt = await persistAttachmentsToIdb(insTempLedgerAttachments);
       const data = {
         date, amount,
         type: document.getElementById('insLType').value,
         method: document.getElementById('insLMethod').value,
         notes: document.getElementById('insLNotes').value.trim(),
-        attachments: syncStampAttachments(priorLedgerEntry ? priorLedgerEntry.attachments : [], persistedLedgerAtt)
+        attachments: await persistAttachmentsToIdb(insTempLedgerAttachments)
       };
       let savedLedgerId;
       if (insEditingLedgerId) {
         const l = p.ledger.find(x => x.id === insEditingLedgerId);
         Object.assign(l, data);
-        bumpVersion(l);
         savedLedgerId = l.id;
       } else {
-        const newEntry = Object.assign({ id: insUid() }, data, freshSyncMeta());
+        const newEntry = Object.assign({ id: insUid() }, data);
         p.ledger.push(newEntry);
         savedLedgerId = newEntry.id;
       }
@@ -5381,8 +4509,6 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       document.getElementById('insSNonGuaranteed').value = '';
       document.getElementById('insBtnAddSurrenderEntry').textContent = '+ Add Statement Record';
       document.getElementById('insBtnCancelSurrenderEdit').style.display = 'none';
-      insTempSurrenderAttachments = [];
-      insRenderSurrenderAttachmentPreview();
     }
     function insRenderSurrenderList(p) {
       const currentEl = document.getElementById('insSurrenderCurrent');
@@ -5390,14 +4516,12 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       currentEl.innerHTML = `<div class="stat-box s-244a7f30"><div class="stat-label">Current Total Surrender Value</div><div class="stat-value s-bffeb9ae">${total === null ? '--' : insFmtMoney(total)}</div></div>`;
 
       const container = document.getElementById('insSurrenderList');
-      const entries = live(p.surrenderRecords).sort((a,b) => new Date(b.date) - new Date(a.date));
+      const entries = [...(p.surrenderRecords||[])].sort((a,b) => new Date(b.date) - new Date(a.date));
       if (!entries.length) {
         container.innerHTML = '<p class="s-51f2817c">No statement records yet. Add one below using figures from your latest Statement of Account.</p>';
         return;
       }
-      container.innerHTML = entries.map(r => {
-        const liveAtts = live(r.attachments || []);
-        return `
+      container.innerHTML = entries.map(r => `
         <div class="s-198fb7f4">
           <div class="s-2447f692">
             <div class="s-ea8a0de7">${escapeHtml(r.date||'--')}</div>
@@ -5410,15 +4534,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
           <div class="s-ebc463b1">
             Bonus ${insFmtMoney(r.accumulatedBonus)} · Investment Fund Value ${insFmtMoney(r.dividend)} · Guaranteed ${insFmtMoney(r.guaranteedCashValue)} · Non-Guaranteed ${insFmtMoney(r.nonGuaranteedValue)}
           </div>
-          ${liveAtts.length ? `<div class="s-bb680ec5">${liveAtts.map((att, idx) => `<span data-ins-open-surrender-att="${escapeHtml(r.id)}" data-ins-att-idx="${idx}" class="s-cd942964">${att.type === 'image' ? '🖼️' : '📄'} ${escapeHtml(att.name)}</span>`).join('')}</div>` : ''}
         </div>
-      `;
-      }).join('');
-      container.querySelectorAll('[data-ins-open-surrender-att]').forEach(el => el.addEventListener('click', () => {
-        const r = p.surrenderRecords.find(x => x.id === el.dataset.insOpenSurrenderAtt);
-        const att = r ? live(r.attachments || [])[parseInt(el.dataset.insAttIdx)] : null;
-        openAttachment(att);
-      }));
+      `).join('');
       container.querySelectorAll('[data-ins-edit-surrender]').forEach(el => el.addEventListener('click', () => {
         const r = p.surrenderRecords.find(x => x.id === el.dataset.insEditSurrender);
         if (!r) return;
@@ -5431,44 +4548,35 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         document.getElementById('insSNonGuaranteed').value = r.nonGuaranteedValue ?? '';
         document.getElementById('insBtnAddSurrenderEntry').textContent = 'Update Statement Record';
         document.getElementById('insBtnCancelSurrenderEdit').style.display = 'inline-block';
-        insTempSurrenderAttachments = r.attachments ? live(r.attachments).map(a => ({ ...a })) : [];
-        insRenderSurrenderAttachmentPreview();
-        document.getElementById('insSurrenderFormTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
       }));
       container.querySelectorAll('[data-ins-remove-surrender]').forEach(el => el.addEventListener('click', () => {
         if (!confirm('Delete this statement record? This cannot be undone.')) return;
         const m = members.find(x => x.id === currentMemberId);
         const p = m.insurance.policies.find(x => x.id === insCurrentSurrenderPolicyId);
-        const s = p.surrenderRecords.find(x => x.id === el.dataset.insRemoveSurrender);
-        if (s) tombstone(s);
+        p.surrenderRecords = p.surrenderRecords.filter(x => x.id !== el.dataset.insRemoveSurrender);
         saveData();
         if (insEditingSurrenderId === el.dataset.insRemoveSurrender) insResetSurrenderForm();
         insRenderSurrenderList(p); renderMain();
       }));
     }
-    document.getElementById('insBtnAddSurrenderEntry').addEventListener('click', async () => {
+    document.getElementById('insBtnAddSurrenderEntry').addEventListener('click', () => {
       const date = document.getElementById('insSDate').value;
       if (!date) { alert('Please enter the statement date'); return; }
-      if (!(await ensureUnlocked())) return;
       const m = members.find(x => x.id === currentMemberId);
       const p = m.insurance.policies.find(x => x.id === insCurrentSurrenderPolicyId);
       if (!p.surrenderRecords) p.surrenderRecords = [];
-      const priorSurrenderEntry = insEditingSurrenderId ? p.surrenderRecords.find(x => x.id === insEditingSurrenderId) : null;
-      const persistedSurrenderAtt = await persistAttachmentsToIdb(insTempSurrenderAttachments);
       const data = {
         date,
         accumulatedBonus: document.getElementById('insSBonus').value,
         dividend: document.getElementById('insSDividend').value,
         guaranteedCashValue: document.getElementById('insSGuaranteed').value,
-        nonGuaranteedValue: document.getElementById('insSNonGuaranteed').value,
-        attachments: syncStampAttachments(priorSurrenderEntry ? priorSurrenderEntry.attachments : [], persistedSurrenderAtt)
+        nonGuaranteedValue: document.getElementById('insSNonGuaranteed').value
       };
       if (insEditingSurrenderId) {
         const r = p.surrenderRecords.find(x => x.id === insEditingSurrenderId);
         Object.assign(r, data);
-        bumpVersion(r);
       } else {
-        p.surrenderRecords.push(Object.assign({ id: insUid() }, data, freshSyncMeta()));
+        p.surrenderRecords.push(Object.assign({ id: insUid() }, data));
       }
       saveData();
       insResetSurrenderForm();
@@ -5476,47 +4584,6 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     });
     document.getElementById('insBtnCancelSurrenderEdit').addEventListener('click', insResetSurrenderForm);
     document.getElementById('insBtnCloseSurrender').addEventListener('click', () => document.getElementById('insSurrenderModal').classList.remove('active'));
-
-    // Statement record attachments (statement / proof documents)
-    document.getElementById('insSFileDropArea').addEventListener('click', async () => { if (await ensureUnlocked()) document.getElementById('insSAttachments').click(); });
-    document.getElementById('insSAttachments').addEventListener('change', async (e) => {
-      const files = Array.from(e.target.files);
-      for (const file of files) {
-        const isImage = file.type.startsWith('image/');
-        const isPdf = file.type === 'application/pdf';
-        if (!isImage && !isPdf) continue;
-        const data = isImage ? await readImageResized(file) : await readFileAsDataUrl(file);
-        if (!data) { alert(`Couldn't read "${file.name}" - it wasn't added.`); continue; }
-        const thumb = isImage ? await readImageThumb(file) : null;
-        insTempSurrenderAttachments.push({ name: file.name, path: `${ATTACHMENTS_FOLDER}/surrender/${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}`, type: isImage ? 'image' : 'pdf', data, thumb, size: data.length });
-        insRenderSurrenderAttachmentPreview();
-      }
-      e.target.value = '';
-    });
-    function insRenderSurrenderAttachmentPreview() {
-      const preview = document.getElementById('insSAttachmentPreview');
-      preview.innerHTML = insTempSurrenderAttachments.map((att, idx) => {
-        const previewSrc = att.thumb || att.data;
-        return `
-        <div class="attachment-item">
-          <div class="attachment-thumb">
-            ${att.type === 'image' && previewSrc ? `<img src="${previewSrc}" alt="">` : `<span>${att.type === 'image' ? '🖼️' : '📄'}</span>`}
-          </div>
-          <div class="attachment-info">
-            <div class="attachment-name">${escapeHtml(att.name)}</div>
-            <div class="attachment-path">${att.size ? formatBytes(att.size) : ''}</div>
-          </div>
-          <span class="attachment-remove" data-idx="${idx}">Remove</span>
-        </div>
-      `;
-      }).join('');
-      preview.querySelectorAll('.attachment-remove').forEach(btn => {
-        btn.addEventListener('click', function() {
-          insTempSurrenderAttachments.splice(parseInt(this.dataset.idx), 1);
-          insRenderSurrenderAttachmentPreview();
-        });
-      });
-    }
 
     // ===== Sum Insured History modal (Reducing Term) =====
     let insEditingSumHistoryId = null;
@@ -5547,7 +4614,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       currentEl.innerHTML = `<div class="stat-box s-244a7f30"><div class="stat-label">Current Sum Insured</div><div class="stat-value s-bffeb9ae">${insFmtMoney(insEffectiveSumInsured(c))}</div></div>`;
 
       const container = document.getElementById('insSumHistoryList');
-      const entries = live(c.sumInsuredHistory).sort((a,b) => new Date(b.date) - new Date(a.date));
+      const entries = [...(c.sumInsuredHistory||[])].sort((a,b) => new Date(b.date) - new Date(a.date));
       if (!entries.length) {
         container.innerHTML = '<p class="s-51f2817c">No history yet. Add the initial amount and each year\'s reduced amount below.</p>';
         return;
@@ -5577,8 +4644,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
         const m = members.find(x => x.id === currentMemberId);
         const p = m.insurance.policies.find(x => x.id === insCurrentSumHistoryPolicyId);
         const c = (p.coverages||[]).find(x => x.id === insCurrentSumHistoryCoverageId);
-        const h = c.sumInsuredHistory.find(x => x.id === el.dataset.insRemoveSumhistory);
-        if (h) tombstone(h);
+        c.sumInsuredHistory = c.sumInsuredHistory.filter(x => x.id !== el.dataset.insRemoveSumhistory);
         saveData();
         if (insEditingSumHistoryId === el.dataset.insRemoveSumhistory) insResetSumHistoryForm();
         insRenderSumHistoryList(c); renderMain();
@@ -5595,9 +4661,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       if (insEditingSumHistoryId) {
         const h = c.sumInsuredHistory.find(x => x.id === insEditingSumHistoryId);
         Object.assign(h, { date, amount });
-        bumpVersion(h);
       } else {
-        c.sumInsuredHistory.push(Object.assign({ id: insUid(), date, amount }, freshSyncMeta()));
+        c.sumInsuredHistory.push({ id: insUid(), date, amount });
       }
       saveData();
       insResetSumHistoryForm();
@@ -5612,9 +4677,9 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       const m = members.find(x => x.id === currentMemberId);
       if (!m) { alert('Select or add a family member first'); return; }
       insEnsureData(m);
-      if (!live(m.insurance.policies).length) { alert('Add a policy for this member first'); return; }
+      if (!m.insurance.policies.length) { alert('Add a policy for this member first'); return; }
       const sel = document.getElementById('insCPolicyId');
-      sel.innerHTML = live(m.insurance.policies).map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(insPolicyTypeSummary(p))}${p.provider ? ' — ' + escapeHtml(p.provider) : ''}</option>`).join('');
+      sel.innerHTML = m.insurance.policies.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(insPolicyTypeSummary(p))}${p.provider ? ' — ' + escapeHtml(p.provider) : ''}</option>`).join('');
       const c = id ? m.insurance.claims.find(x => x.id === id) : null;
       document.getElementById('insClaimModalTitle').textContent = id ? 'Edit Claim' : 'Add Claim';
       if (c) sel.value = c.policyId;
@@ -5630,7 +4695,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
     function insPopulateCoverageSelect(m, policyId, selectedCoverageId) {
       const p = m.insurance.policies.find(x => x.id === policyId);
       const covSel = document.getElementById('insCCoverageId');
-      const coverages = p ? live(p.coverages || []) : [];
+      const coverages = p ? (p.coverages || []) : [];
       if (!coverages.length) {
         covSel.innerHTML = '<option value="">(no coverage details on this policy)</option>';
         return;
@@ -5654,9 +4719,8 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       if (insEditingClaimId) {
         const c = m.insurance.claims.find(x => x.id === insEditingClaimId);
         Object.assign(c, data);
-        bumpVersion(c);
       } else {
-        m.insurance.claims.push(Object.assign({ id: insUid() }, data, freshSyncMeta()));
+        m.insurance.claims.push(Object.assign({ id: insUid() }, data));
       }
       saveData();
       document.getElementById('insClaimModal').classList.remove('active');
@@ -5669,7 +4733,7 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       const m = members.find(x => x.id === memberId);
       const sel = document.getElementById('insRPolicyId');
       sel.innerHTML = '<option value="all">📋 All Policies (full summary)</option>' +
-        live(m.insurance.policies).map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(insPolicyTypeSummary(p))}${p.provider ? ' — ' + escapeHtml(p.provider) : ''}${p.status === 'Discontinued' ? ' (Discontinued)' : ''}</option>`).join('');
+        m.insurance.policies.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(insPolicyTypeSummary(p))}${p.provider ? ' — ' + escapeHtml(p.provider) : ''}${p.status === 'Discontinued' ? ' (Discontinued)' : ''}</option>`).join('');
       sel.value = preselectPolicyId || 'all';
       document.getElementById('insRIncludeDiscontinued').checked = false;
       document.getElementById('insReportModal').classList.add('active');
@@ -5745,16 +4809,16 @@ ${encrypt ? `- Full encryption: the backup JSON AND every file inside attachment
       let policiesToShow;
       let reportTitle;
       if (selectedId === 'all') {
-        policiesToShow = live(m.insurance.policies).filter(p => includeDiscontinued || p.status !== 'Discontinued');
+        policiesToShow = m.insurance.policies.filter(p => includeDiscontinued || p.status !== 'Discontinued');
         reportTitle = `Insurance Report — ${m.name}`;
       } else {
-        policiesToShow = live(m.insurance.policies).filter(p => p.id === selectedId);
+        policiesToShow = m.insurance.policies.filter(p => p.id === selectedId);
         reportTitle = `Policy Report — ${m.name}`;
       }
 
       let summaryHtml = '';
       if (selectedId === 'all') {
-        const activePolicies = live(m.insurance.policies).filter(p => p.status !== 'Discontinued');
+        const activePolicies = m.insurance.policies.filter(p => p.status !== 'Discontinued');
         const insuredByType = {};
         const assetByType = {};
         const ASSET_TYPES = ['Home', 'Car'];

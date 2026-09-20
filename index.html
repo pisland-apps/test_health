@@ -112,7 +112,7 @@
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
     script-src 'self';
-    style-src 'self' 'sha256-68Ma99oJG+yOUASlZ/UbGK8ZYKvB6SX2cPO0joLvXno=';
+    style-src 'self' 'sha256-wZY2O4EaSixLAY8ppr8nayWnNzpbd+T0pJChX+x4kAk=';
     img-src 'self' data: blob:;
     font-src 'self';
     connect-src 'self';
@@ -379,70 +379,10 @@
     .member-item:hover .member-delete { opacity: 1; }
     .member-delete:hover { background: var(--danger-light); color: var(--danger); }
 
-    /* ===== Print current page (v41) =====
-       Same approach as the Ledger app's printCurrentApp(): a floating 🖨️ button
-       calls printCurrentPage() in app.js, which injects a small #printHeader
-       (app name / member / tab / print time) and calls window.print(); this
-       @media print block then strips the app chrome so only the member's
-       currently open view prints, as normal flowing pages. The 9 report popups
-       (Emergency Card, Health Summary, insurance report, ...) are separate
-       documents and are NOT affected by anything in here. */
-    .print-fab-btn {
-      position: fixed; right: 20px; bottom: 32px; z-index: 48;
-      width: 44px; height: 44px; border-radius: 50%;
-      background: var(--surface); color: var(--primary);
-      border: 1.5px solid var(--border);
-      font-size: 19px; line-height: 1; cursor: pointer;
-      display: flex; align-items: center; justify-content: center;
-      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
-      transition: transform 0.12s ease, box-shadow 0.12s ease;
-    }
-    .print-fab-btn:active { transform: scale(0.94); box-shadow: 0 1px 4px rgba(15, 23, 42, 0.2); }
-    /* Same trick as the Ledger: the button is the last child of <body>, after every
-       .modal-overlay, so pure CSS can hide it while any modal is open (the lock screen
-       is z-index 9999, so it already covers the button on its own). */
-    .modal-overlay.active ~ .print-fab-btn { display: none; }
-    /* Keep the last card's bottom-right corner from ending up underneath the button */
-    .main { padding-bottom: 84px; }
-    #printHeader { display: none; }
-
     @media print {
-      /* App chrome / controls that only make sense on screen */
-      #offlineBanner, #versionBadge, #appLockScreen, .header, .sidebar, .sidebar-backdrop,
-      .modal-overlay, .print-fab-btn, .tabs, .mode-switch, .btn, button, select,
-      input[type="file"], .member-delete, .policy-actions, .print-skip,
-      span[data-ins-open-surrender], [data-ins-open-sumhistory] {
-        display: none !important;
-      }
-      /* ...except the Surrender Value button, which carries a real figure, not just a control */
-      button.btn[data-ins-open-surrender] {
-        display: inline-block !important;
-        background: none !important; border: none !important; padding: 0 !important;
-        font-size: 13px !important; font-weight: 600 !important; color: var(--text) !important;
-      }
-      /* The app lays out as a fixed-height flex row whose .main scrolls internally --
-         that would clip the print to a single page, so flatten all of it. */
-      html, body { background: #fff !important; height: auto !important; overflow: visible !important; margin: 0 !important; padding: 0 !important; }
-      .container { display: block !important; height: auto !important; }
-      .main { display: block !important; overflow: visible !important; height: auto !important; width: 100% !important; max-width: 100% !important; padding: 0 !important; }
-      #printHeader {
-        display: block !important;
-        margin-bottom: 16px; padding-bottom: 10px;
-        border-bottom: 2px solid #0f172a;
-      }
-      #printHeader .print-header-title { font-size: 1.15rem; font-weight: 800; color: #0f172a; }
-      #printHeader .print-header-sub { font-size: 0.78rem; color: #475569; margin-top: 2px; }
-      /* Shadows print as grey smudges; colored backgrounds (tags, timeline dots, avatar,
-         stat boxes) are dropped by default unless print-color-adjust is set. */
-      * { box-shadow: none !important; text-shadow: none !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-      .card, .policy-card { border: 1px solid #cbd5e1 !important; break-inside: avoid; }
-      /* A card holding a long record timeline / list of policies must be allowed to
-         split across pages (:has() is progressive -- where unsupported the card just
-         keeps break-inside: avoid, which browsers ignore for taller-than-a-page boxes). */
-      .card:has(.timeline), .card:has(.policy-card) { break-inside: auto; }
-      .timeline-item, .reminder-item, .attachment-item, .policy-card { break-inside: avoid; }
-      .card-title { break-after: avoid; }
-      a[href]::after { content: none !important; }
+      .sidebar, .header, .btn { display: none !important; }
+      .main { padding: 0; }
+      .card { box-shadow: none; border: 1px solid #ddd; }
     }
 
     /* ===== Auto-generated utility classes (CSP hardening, 2026-08-10) =====
@@ -700,7 +640,6 @@
       <h1>🏥🛡️ Family Health & Shield</h1>
     </div>
     <div class="header-actions">
-      <button class="btn btn-secondary btn-sm" id="btnConflicts" style="display:none;">⚠️ Conflicts (<span id="conflictCount">0</span>)</button>
       <button class="btn btn-secondary btn-sm" id="btnExport">📥 Export All</button>
       <button class="btn btn-secondary btn-sm" id="btnExportMember">📤 Export Member</button>
       <button class="btn btn-secondary btn-sm" id="btnImport">📥 Import</button>
@@ -945,20 +884,6 @@
       <div class="modal-actions">
         <button class="btn btn-secondary" id="btnCancelReminder">Cancel</button>
         <button class="btn btn-primary" id="btnSaveReminder">Save</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Conflict Review Modal (build order step 5) -->
-  <div class="modal-overlay" id="conflictModal">
-    <div class="modal" style="max-width:640px;">
-      <div class="modal-header">⚠️ Review Conflicting Edits</div>
-      <div class="s-06d0d891">
-        These fields or entries were edited on both sides since the last sync. Your device's version is showing for each right now — pick which to keep, or (where offered) keep both as separate entries.
-      </div>
-      <div id="conflictListBody"></div>
-      <div class="modal-actions">
-        <button class="btn btn-secondary" id="btnCloseConflicts">Close</button>
       </div>
     </div>
   </div>
@@ -1315,15 +1240,6 @@
           <label class="form-label">Non-Guaranteed Value</label>
           <input class="form-input" type="number" step="0.01" id="insSNonGuaranteed" placeholder="e.g. 3000">
         </div>
-        <div class="form-group s-506be65f">
-          <label class="form-label">Attachment (statement / proof document)</label>
-          <input type="file" id="insSAttachments" multiple accept="image/*,.pdf" class="s-cb458930">
-          <div class="file-input-area s-29243394" id="insSFileDropArea">
-            <div class="s-c91e236c">📎</div>
-            <div class="s-6378db95">Click to select files</div>
-          </div>
-          <div class="attachment-list" id="insSAttachmentPreview"></div>
-        </div>
         <div class="s-a18aecfa">
           <button type="button" class="btn btn-primary btn-sm" id="insBtnAddSurrenderEntry">+ Add Statement Record</button>
           <button type="button" class="btn btn-secondary btn-sm s-93b8ea5b" id="insBtnCancelSurrenderEdit">Cancel Edit</button>
@@ -1436,12 +1352,6 @@
     </div>
   </div>
 
-  <!-- Global "print this page" button (v41). Deliberately the LAST element before the scripts,
-       after every .modal-overlay, so the `.modal-overlay.active ~ .print-fab-btn` CSS rule can
-       hide it while a modal is open. Wired to printCurrentPage() in app.js. -->
-  <button type="button" class="print-fab-btn" id="btnPrintPage" aria-label="Print this page" title="Print this page">🖨️</button>
-
-  <script src="merge-engine.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
