@@ -7,8 +7,8 @@
     // Service Worker and has no effect on caching. It does NOT auto-sync with
     // CACHE_VERSION in service-worker.js since they live in different files — bump both
     // together on every deploy. (Reminder comment also left in service-worker.js.)
-    const APP_VERSION = 'v41';
-    const APP_VERSION_DATE = '2026-09-20';
+    const APP_VERSION = 'v40';
+    const APP_VERSION_DATE = '2026-09-19';
     // Populate the badge immediately — app.js is loaded at the end of <body>, so the DOM
     // (including #versionBadge) already exists by the time this line runs. Deliberately
     // done at top level, not inside init()/initAppData(), so it renders before any
@@ -3019,87 +3019,64 @@
     }
 
     // ========== EMERGENCY CARD ==========
-    // Renders a PDF (as a data: URL) into `container` as one <canvas> per
-    // page - same approach as the attachment viewer (see openAttachment
-    // for the full rationale: consistent cross-platform rendering, and
-    // avoids needing object-src for <embed>, which this page's CSP doesn't
-    // grant). Canvas styling is set via JS property assignment, not
-    // style="..." attributes, since style-src here only allows this page's
-    // one hash-locked <style> block.
-    async function renderPdfIntoContainer(dataUrl, container) {
-      try {
-        const blob = dataUrlToBlob(dataUrl);
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        const pdfjsLib = await pdfjsLibPromise;
-        const pdf = await pdfjsLib.getDocument({ data: bytes, isEvalSupported: false }).promise;
-        const containerWidth = container.clientWidth || 360;
-        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-          const page = await pdf.getPage(pageNum);
-          const unscaledViewport = page.getViewport({ scale: 1 });
-          const scale = Math.max(0.1, (containerWidth - 20) / unscaledViewport.width);
-          const viewport = page.getViewport({ scale });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          canvas.style.display = 'block';
-          canvas.style.maxWidth = '100%';
-          canvas.style.margin = '6px auto';
-          container.appendChild(canvas);
-          await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-        }
-      } catch (pdfErr) {
-        const msg = document.createElement('div');
-        msg.textContent = 'Could not render the attached PDF for printing: ' + pdfErr.message;
-        container.appendChild(msg);
-      }
-    }
-
     async function printEmergency(memberId) {
       const m = members.find(x => x.id === memberId);
       if (!m) return;
       const latest = getLatestVitals(m);
       const age = m.birth ? Math.floor((new Date() - new Date(m.birth)) / 365.25 / 24 / 60 / 60 / 1000) : '?';
       const bloodAttData = await resolveAttachmentData(m.bloodTypeAttachment);
-      const isPdfAtt = bloodAttData && (m.bloodTypeAttachment.type !== 'image');
 
-      const printContainer = document.getElementById('printContainer');
-      printContainer.innerHTML = `
-        <div class="pe-card">
-          <h1 class="pe-title">🚨 Emergency Medical Info</h1>
-          <div class="pe-grid">
-            <div class="pe-item"><div class="pe-label">Name</div><div class="pe-value">${escapeHtml(m.name)}</div></div>
-            <div class="pe-item"><div class="pe-label">Age/Gender</div><div class="pe-value">${age}y / ${escapeHtml(m.gender)}</div></div>
-            <div class="pe-item"><div class="pe-label">Blood Type</div><div class="pe-value">${escapeHtml(m.blood)}</div></div>
-            <div class="pe-item"><div class="pe-label">Emergency Contact</div><div class="pe-value">${escapeHtml(m.emergency) || 'None'}</div></div>
-            ${m.allergies !== 'None' ? `<div class="pe-item pe-full pe-alert">⚠️ Allergies: ${escapeHtml(m.allergies)}</div>` : ''}
-            <div class="pe-item pe-full"><div class="pe-label">Medical History</div><div class="pe-value pe-history-value">${escapeHtml(m.history) || 'None'}</div></div>
-            ${latest.systolic ? `<div class="pe-item"><div class="pe-label">Recent BP</div><div class="pe-value">${latest.systolic}/${latest.diastolic}</div></div>` : ''}
-            ${latest.heartRate ? `<div class="pe-item"><div class="pe-label">Recent HR</div><div class="pe-value">${latest.heartRate} bpm</div></div>` : ''}
+      // Print-report popups (this one and the 8 others like it, e.g. printVaccineRecord,
+      // printMedicationList, insOpenPrintWindow) are deliberately NOT covered by the main
+      // app's tightened style-src/script-src — they're static, ephemeral, same-origin popup
+      // documents (not the encrypted-data app shell), so each gets its own explicit CSP meta
+      // tag below rather than silently relying on the main document's policy. Kept permissive
+      // for exactly what these pages use: inline <style> for the print layout, an inline
+      // onclick/window.onload for the print button/auto-print, and data:/blob: <img>/<embed>
+      // for decrypted attachment previews. connect-src/default-src stay locked to 'none' so
+      // nothing on this page can make a network request even if something were ever injected.
+      const printWindow = window.open('', '_blank');
+      printWindow.document.write(`
+        <html><head><title>Emergency Card - ${escapeHtml(m.name)}</title>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; object-src data:; base-uri 'none'; form-action 'none';">
+        <style>
+          body { font-family: Arial, sans-serif; padding: 20px; max-width: 400px; margin: 0 auto; }
+          .card { border: 3px solid #dc2626; border-radius: 12px; padding: 20px; }
+          h1 { color: #dc2626; text-align: center; margin: 0 0 16px; font-size: 22px; }
+          .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+          .item { background: #fef2f2; padding: 10px; border-radius: 8px; }
+          .label { font-size: 11px; color: #666; text-transform: uppercase; }
+          .value { font-size: 16px; font-weight: bold; margin-top: 2px; }
+          .full { grid-column: 1 / -1; }
+          .alert { background: #dc2626; color: white; padding: 10px; border-radius: 8px; text-align: center; font-weight: bold; }
+        </style></head><body>
+        <div class="card">
+          <h1>🚨 Emergency Medical Info</h1>
+          <div class="grid">
+            <div class="item"><div class="label">Name</div><div class="value">${escapeHtml(m.name)}</div></div>
+            <div class="item"><div class="label">Age/Gender</div><div class="value">${age}y / ${escapeHtml(m.gender)}</div></div>
+            <div class="item"><div class="label">Blood Type</div><div class="value">${escapeHtml(m.blood)}</div></div>
+            <div class="item"><div class="label">Emergency Contact</div><div class="value">${escapeHtml(m.emergency) || 'None'}</div></div>
+            ${m.allergies !== 'None' ? `<div class="item full alert">⚠️ Allergies: ${escapeHtml(m.allergies)}</div>` : ''}
+            <div class="item full"><div class="label">Medical History</div><div class="value" style="font-size:14px;">${escapeHtml(m.history) || 'None'}</div></div>
+            ${latest.systolic ? `<div class="item"><div class="label">Recent BP</div><div class="value">${latest.systolic}/${latest.diastolic}</div></div>` : ''}
+            ${latest.heartRate ? `<div class="item"><div class="label">Recent HR</div><div class="value">${latest.heartRate} bpm</div></div>` : ''}
           </div>
           ${bloodAttData ? `
-          <div class="pe-item pe-full pe-att-block">
-            <div class="pe-label">Blood Type Test Report</div>
-            ${m.bloodTypeAttachment.type === 'image' ? `<img class="pe-att-img" src="${bloodAttData}">` : `<div id="peBloodPdfSlot"></div>`}
+          <div class="item full" style="margin-top:10px;">
+            <div class="label">Blood Type Test Report</div>
+            ${m.bloodTypeAttachment.type === 'image'
+              ? `<img src="${bloodAttData}" style="max-width:100%;border-radius:6px;margin-top:6px;">`
+              : `<embed src="${bloodAttData}" type="application/pdf" style="width:100%;height:300px;margin-top:6px;">`}
           </div>
           ` : ''}
-          <p class="pe-footer">Generated: ${new Date().toLocaleString()}</p>
+          <p style="text-align:center;color:#666;font-size:12px;margin-top:16px;">Generated: ${new Date().toLocaleString()}</p>
         </div>
-      `;
-      // Fully class-based (no style="..." attributes anywhere above): this
-      // page's CSP hash-locks the <style> BLOCK, but a hash alone (without
-      // the separate 'unsafe-hashes' keyword, which this CSP doesn't have)
-      // does NOT cover style="..." attributes - those would be silently
-      // stripped by the browser regardless of the block's hash matching.
-      if (isPdfAtt) {
-        await renderPdfIntoContainer(bloodAttData, document.getElementById('peBloodPdfSlot'));
-      }
-
-      window.print();
+        </body></html>
+      `);
+      printWindow.document.close();
+      setTimeout(() => printWindow.print(), 200);
     }
-    window.addEventListener('afterprint', () => {
-      const pc = document.getElementById('printContainer');
-      if (pc) pc.innerHTML = ''; // don't keep decrypted attachment data sitting in the DOM after printing
-    });
 
     // ========== 1. HEALTH SUMMARY REPORT ==========
     async function printHealthSummary(memberId, selectedAttachmentKeys = null) {

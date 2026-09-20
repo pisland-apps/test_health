@@ -112,7 +112,7 @@
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
     script-src 'self';
-    style-src 'self' 'sha256-ZNJt1NBp2kAxwsSH4ByC3aXiQR2HP8Gzx9TnvAfJTk4=';
+    style-src 'self' 'sha256-wZY2O4EaSixLAY8ppr8nayWnNzpbd+T0pJChX+x4kAk=';
     img-src 'self' data: blob:;
     font-src 'self';
     connect-src 'self';
@@ -594,40 +594,6 @@
     .s-quotafill { height:100%; border-radius:999px; }
     .s-ledger-payout { font-weight:700; color:var(--success); }
     .s-ledger-expense { font-weight:700; color:var(--text); }
-
-    /* ===== In-app print reports (build order: Emergency Card first, see
-       README changelog) ===== 
-       Deliberately NOT the old window.open('',' _blank')+document.write
-       popup approach the other 8 report functions still use - those write
-       an entirely separate document with its own relaxed per-page CSP
-       (see the comment above printEmergency's old window.open call for
-       why). Printing in-page instead means the report HTML lives under
-       this page's OWN (tighter) CSP, so: no inline <style> tag or
-       style="..." attributes in report markup (style-src only allows this
-       hash-locked block, not 'unsafe-inline') - report elements are
-       styled via the plain classes below instead; and no <embed>/<object>
-       for PDF preview (object-src 'none' here, unlike the popup reports'
-       object-src data:) - PDF pages render via the same pdf.js-to-canvas
-       approach the attachment viewer already uses (see openAttachment).
-       #printContainer is hidden on screen and only shown for @media print,
-       which also hides everything else so only the report comes out. */
-    #printContainer { display: none; }
-    @media print {
-      body > *:not(#printContainer) { display: none !important; }
-      #printContainer { display: block !important; }
-    }
-    .pe-card { border: 3px solid #dc2626; border-radius: 12px; padding: 20px; max-width: 400px; margin: 0 auto; font-family: Arial, sans-serif; }
-    .pe-title { color: #dc2626; text-align: center; margin: 0 0 16px; font-size: 22px; }
-    .pe-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .pe-item { background: #fef2f2; padding: 10px; border-radius: 8px; }
-    .pe-label { font-size: 11px; color: #666; text-transform: uppercase; }
-    .pe-value { font-size: 16px; font-weight: bold; margin-top: 2px; }
-    .pe-full { grid-column: 1 / -1; }
-    .pe-alert { background: #dc2626; color: white; padding: 10px; border-radius: 8px; text-align: center; font-weight: bold; }
-    .pe-footer { text-align:center; color:#666; font-size:12px; margin-top:16px; }
-    .pe-att-img { max-width:100%; border-radius:6px; margin-top:6px; display:block; }
-    .pe-history-value { font-size:14px; }
-    .pe-att-block { margin-top:10px; }
   </style>
 </head>
 <body>
@@ -1409,8 +1375,6 @@
       </div>
     </div>
   </div>
-
-  <div id="printContainer"></div>
 
   <script src="merge-engine.js"></script>
   <script src="app.js"></script>
