@@ -16,6 +16,9 @@
 family-health-shield/
 ├── index.html              ← 主应用页面(结构 + 样式)
 ├── app.js                   ← 主应用逻辑(原先内联在 index.html 里,现已拆成外部文件)
+├── merge-engine.js           ← 单成员导入的字段/条目级合并引擎(纯函数,UMD 封装,浏览器/Node 双环境可用),设计详见 MERGE_SYNC_DESIGN.md
+├── merge-engine.test.js      ← merge-engine.js 的 Node 测试(`node merge-engine.test.js` 直接跑,不需要额外装测试框架)
+├── MERGE_SYNC_DESIGN.md      ← 单成员合并同步功能的完整设计文档(语义决定 + 实现细节两部分)
 ├── manifest.json            ← Web App Manifest(可安装为 PWA)
 ├── service-worker.js        ← 离线缓存(App Shell 预缓存 + cache-first)
 ├── _headers                  ← Cloudflare Pages 自定义响应头(CSP frame-ancestors / X-Frame-Options 等,GitHub Pages 不支持,故需换托管平台)
@@ -75,7 +78,7 @@ const CACHE_VERSION = 'v1';
 
 应用逻辑现在是独立的 `app.js` 文件,CSP 用 `script-src 'self'` 直接放行,不再依赖哈希白名单(曾经用过 `sha256-...` 哈希锁定内联 `<script>`,但本地算好的哈希在 push 到 GitHub Pages 后经常和线上文件字节对不上,导致整个 App 白屏——具体原因见 `index.html` 头部的设计说明注释)。
 
-**所以现在改 `app.js` 不需要额外步骤**,和改 `index.html` / `manifest.json` 一样,记得同步更新下面这条的 `CACHE_VERSION`,并且部署时要把 `app.js` 和 `index.html` 一起 push——只推 `index.html` 会导致线上白屏(`index.html` 会去请求一个不存在的 `app.js`)。
+**所以现在改 `app.js` 不需要额外步骤**,和改 `index.html` / `manifest.json` 一样,记得同步更新下面这条的 `CACHE_VERSION`,并且部署时要把 `app.js`、`merge-engine.js` 和 `index.html` 一起 push——只推 `index.html` 会导致线上白屏(`index.html` 会去请求不存在的 `app.js`/`merge-engine.js`)。
 
 `scripts/update_csp_hash.py` 和 `.githooks/pre-commit` 是旧哈希方案留下的维护脚本,现在用不上了,可以删除。
 
@@ -115,3 +118,35 @@ const CACHE_VERSION = 'v1';
 - v27(2026-08-14)锁屏/解锁屏加了大号触屏数字键盘:两个"输入现有密码"的界面(`appLockScreen` 的 `appLockPasscodeInput`、解锁弹窗的 `unlockPasscodeInput`)新增 `.numpad` 数字键盘,方便手机/平板输入。输入框本身加了 `inputmode="none"`,数字键盘按钮只会往 `input.value` 写字符、从不调用 `.focus()`,所以点数字键盘不会弹出系统输入法;因为密码不限制必须是数字(只要求 6 位以上),键盘旁边留了一个 ⌨️ 切换按钮,给密码里带字母/符号的人切回普通输入法。这次改动往 `index.html` 的 `<style>` 块里加了 numpad 的 CSS,按 README 前面"务必阅读"那条提醒跑了 `regen-style-hash.py` 重新生成了哈希并同步贴到了 `index.html` 和 `_headers` 两处。`APP_VERSION`/`APP_VERSION_DATE`(app.js)和 `CACHE_VERSION`(service-worker.js)都已同步改成 v27——上一版数字键盘功能虽然做了,但漏了这一步,导致老用户的浏览器会因为 Service Worker 缓存继续拿到没有数字键盘的旧版本;这一版已修正。
 - v28(2026-09-07)附件(照片/PDF)预览弹窗改版,对齐了另一个姊妹项目(Ledger 记账本)里更成熟的查看器布局:①弹窗从固定 `max-width:720px` 改成 `95vw × 88vh`,尽量用满屏幕;②弹窗背景遮罩从浅色 `rgba(0,0,0,0.4)` 加深到 `rgba(0,0,0,0.85)`,看照片/PDF 时不刺眼;③修复一个实际存在的问题——原来标题、内容、"下载/关闭"按钮是整体一起滚动的,遇到多页 PDF 时按钮会被顶到最下面,得先滚到底才能点"关闭";现在改成标题和按钮固定不动,只有中间的内容区域自己滚动。顺带修了预览区域的排列方式:原来是默认的 `flex` 横向排列且 `overflow:hidden`,多页 PDF 的画布本该竖着一页页排开,结果理论上会被挤成一排还被裁掉看不到——改成 `flex-direction:column` 纵向堆叠、`overflow-y:auto` 允许滚动。这次改动改了 `index.html` 的 `<style>` 块(只涉及 `attachmentViewerModal` 专用的两个哈希类,没碰其他共用样式),已按提醒跑了 `regen-style-hash.py`,新哈希已同步贴进 `index.html` 和 `_headers` 两处。`APP_VERSION`/`APP_VERSION_DATE`(app.js)和 `CACHE_VERSION`(service-worker.js)已同步改成 v28。
 - v29(2026-09-07)保单 Premium Ledger 的"付款方式"下拉菜单新增一项"Credit Card"(信用卡),插在 Auto-Debit 和 Cash 之间。这个字段在代码里只是存成自由文本(`l.method`)展示,没有任何按具体选项分支的图标/逻辑,所以只改了 `index.html` 里的 `<option>` 列表,没碰其他地方。这次改动不涉及 `<style>` 块,不需要重新生成 CSP 哈希。`APP_VERSION`/`APP_VERSION_DATE`(app.js)和 `CACHE_VERSION`(service-worker.js)已同步改成 v29。
+- v32-v39(2026-09-17~18)**单个成员导入不再是整体覆盖,改成字段/条目级别的合并同步**——这是这几版里最大的一次数据模型改动,建议部署前完整看完这一条。
+
+  **要解决的问题**:原来"导出单个成员 → 对方编辑 → 导入回主文件"这条路径,导入时是整个成员对象覆盖,哪怕只想同步对方新增的一条记录,自己这边同期做的任何修改都会被整份替换掉,没有任何合并逻辑,详细设计取舍记录在仓库里新增的 `MERGE_SYNC_DESIGN.md`。
+
+  **新增的数据字段**(每个可同步的实体——成员、健康记录、提醒、保单及其名下的 Ledger/Rider/Coverage/Sum Insured History/Surrender Record/Claim——现在都带):
+  - `version`:逻辑时钟(不是挂钟时间戳),每次本地编辑 +1,合并时取双方较大值
+  - `deletedAt`:软删除标记,删除操作不再从数组里物理移除,只是标记,永久保留(不做自动物理清理)
+  - `schemaVersion`:为以后字段结构迁移预留
+  - 成员额外带 `fieldVersion`(姓名/血型/过敏史等标量字段各自独立计版本,两人分别改了不同字段不会互相覆盖)和 `historyEntries`(病史字段的底层从纯文本升级成带 id/version 的条目数组,但 v1 界面还是单段编辑,行为上感觉不出区别)
+
+  **合并规则**(纯函数实现在新增的 `merge-engine.js` 里,`merge-engine.test.js` 有 67 条测试,含一轮随机模糊测试):数组类数据(记录、保单等)按 id 取并集;同一 id 版本不同,版本高的赢;版本相同但内容不同 → 判定为"冲突",不自动二选一,保留本机版本,把对方版本存进冲突队列等你确认。
+
+  **新增的冲突处理界面**:发现冲突时,页头会出现"⚠️ Conflicts (N)"按钮,点开是一个列表,每条冲突显示"你这边 / 对方那边"的简要对比,可以选"保留我的" / "保留对方的" / (记录类条目可选)"两个都留着"(会复制一份新 id 的记录)。
+
+  **删除行为的变化**:因为改成软删除,一台设备删掉的东西不会再在另一台设备重新导入时"复活"——但也意味着已删除的数据不会真的从存储里清空(只是不再显示),如果对隐私/存储空间比较敏感,导出的备份文件里仍然会带着这些标记为已删除的记录,只是主界面不显示。
+
+  **升级注意事项(强烈建议)**:首次用这个版本打开 App 时,所有现存数据会被一次性打上 `version=1` 的标记(`migrateSyncFields()`,幂等,重复运行不会有副作用)。**如果家里有多台设备,建议升级后先让每台设备互相同步一次(导出/导入跑一轮),再继续各自编辑**——因为升级当天,各设备本地数据都是"从同一个起点开始计版本",如果升级前就存在尚未同步的分歧,这次升级不会自动帮你合并那些旧分歧,只会当作新的冲突处理,越早同步一次,冲突越少。
+
+  **全量导出("Export All")的行为不变**,依然是整份覆盖,这次改动只影响"导出单个成员"这一条路径,详见 `MERGE_SYNC_DESIGN.md` 里的范围说明。
+
+  这次改动新增了两个文件(`merge-engine.js`、`merge-engine.test.js`),`service-worker.js` 的预缓存列表(`APP_SHELL`)已加入 `merge-engine.js`,`index.html` 已在 `app.js` 之前加上对应的 `<script>` 标签。没有改 `<style>` 块,不需要重新生成 CSP 哈希。`APP_VERSION`/`APP_VERSION_DATE`(app.js)和 `CACHE_VERSION`(service-worker.js)已同步改成 v39。
+- v40(2026-09-19)修复导出/重新导入同一份未改动的文件时,"血型检测报告"这个字段会被误判成冲突的问题。原因:这个字段走的是逐字段比较(`deepEqual`),但导出的文件里这个附件永远带着完整的图片/PDF 原始数据(`.data`,方便脱机携带),而本机存的那份从来不带 `.data`(已经存进 IndexedDB,主数据里只留 id/name/path 等元信息)——所以哪怕内容完全一样,一比较"本机的瘦身版"跟"刚导入的带 `.data` 胖版",永远判定"不一样"。修了 `merge-engine.js` 里专门给这个字段用的比较逻辑,比较前先把两边的 `.data` 都去掉,但被选中保留的那份仍然带着完整数据,不影响功能。`merge-engine.test.js` 补了 3 条回归测试(现在共 70 条,全部通过)。`APP_VERSION`/`CACHE_VERSION` 已同步改成 v40。
+- v41(2026-09-20)"🚨 Emergency Card"这一个打印报告,从"另开一个浏览器分页/弹窗打印"改成跟 Ledger 那边一样,直接在本页面内触发浏览器原生打印(`window.print()`),不再跳出新分页。其余 8 个打印报告(Health Summary、疫苗记录、用药清单、检验报告、血压/体重趋势、年度报告、保单/结单报告)这次没有动,还是原来的弹窗方式——用户确认这个改法感觉对了之后再一起改。
+
+  **实现方式**:新增一个平时隐藏的 `#printContainer`(`display:none`),只在 `@media print` 时显示,同时把页面上其它所有元素都强制隐藏,这样打印出来的只有报告本身。`printEmergency()` 不再 `document.write` 到一个新窗口,改成把报告 HTML 写进这个容器,再直接调用 `window.print()`。
+
+  **CSP 相关的两个坑,踩过了记录一下**:①原来的弹窗报告因为是完全独立的文档,给自己单独开了一个宽松的 CSP(`style-src 'unsafe-inline'`、`object-src data:`),跟主 App 的 CSP 没关系;改成页面内打印之后,报告内容现在要遵守主 App 更严格的 CSP,所以报告里不能再用内联 `<style>` 或 `style="..."` 属性(哪怕 `<style>` 块本身有哈希,单独的 `style="..."` 属性也不受那个哈希覆盖,除非 CSP 里另外声明 `'unsafe-hashes'`,这份 CSP 没有——写了才发现这个细节,一开始差点漏了两处内联 style,已经全部改成 class)。②原来血型报告里的 PDF 用 `<embed>` 展示,但主 CSP 是 `object-src 'none'`,`<embed>` 会被直接拦掉;改成复用附件预览已经在用的 pdf.js 方案,把 PDF 每一页画成 `<canvas>`,不依赖 `object-src`。这次改了 `<style>` 块,已经跑过 `regen-style-hash.py` 重新生成哈希,`index.html` 和 `_headers` 两处都已同步改成新哈希。`APP_VERSION`/`CACHE_VERSION` 已同步改成 v41。
+- v42(2026-09-20)**v41 发布后整个 App 直接"裸奔"(样式完全没生效,退化成没有 CSS 的纯 HTML),原因是 `regen-style-hash.py` 算出来的哈希其实是错的**——起因是 v41 那次改动里,我在新加的 CSS 注释里写了"no inline `<style>` tag or..."这句话,注释本身躺在真正的 `<style>` 块里面,而这段注释文字恰好包含了字面意义上的 `<style>` 这几个字符;脚本原本用"从最后一个 `</style>` 往前找最近的 `<style>`"来定位真正的开始位置,这个办法只防得住"真正的开始标签之前"出现的干扰文本(比如本文件开头那段设计说明注释里也提到过好几次 `<style>`,这个脚本本来就是为了绕开那些才这样写的),但防不住"开始标签之后、结束标签之前"出现的干扰文本——我注释里那个 `<style>` 恰好就长在这个位置,离真正的 `</style>` 比真正的 `<style>` 更近,脚本于是从我注释中间开始截取,算出来的哈希对应的根本不是真正的完整样式内容。浏览器是按真实完整内容算哈希的,两边对不上,CSP 直接整块拒绝渲染 `<style>`,但这个失败没有任何控制台报错提示——只会表现成界面突然"没有样式"。
+
+  **两处修复**:①把那句注释改写成不含字面 `<style>`/`</style>` 文字的说法(改成"an inline style block"这种没有尖括号的写法)。②给 `regen-style-hash.py` 本身加固:算完之后额外检查提取出来的内容本身是否还包含 `<style>`/`</style>` 字样(正常的 CSS 内容不可能包含这个),以及提取长度是否明显偏短(真实样式块一直是三万多字符,几千字符以内基本可以确定提取错了)——两个检查任一个没通过就直接报错退出,不再吐出一个"看起来正常但其实是错的"哈希。已经用改动前的错误版本验证过,加固后的脚本确实会在这种情况下正确报错拦下来,不会重蹈覆辙。
+
+  这次教训:以后往 `<style>` 块里写注释,提到"style 标签"本身时,不要用尖括号包起来的字面写法,脚本现在会主动拦截这种情况,但养成习惯更保险。`APP_VERSION`/`CACHE_VERSION` 已同步改成 v42(这个版本号的提升本身很关键——不提升的话 Service Worker 不会知道要重新抓取修好的 `index.html`,会一直把坏掉的版本缓存下去)。

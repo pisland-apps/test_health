@@ -112,7 +112,7 @@
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'none';
     script-src 'self';
-    style-src 'self' 'sha256-wZY2O4EaSixLAY8ppr8nayWnNzpbd+T0pJChX+x4kAk=';
+    style-src 'self' 'sha256-7qS7OHYWcd/wVfLkMX+LsPXrv8S2lKSGheWWxuuWV/c=';
     img-src 'self' data: blob:;
     font-src 'self';
     connect-src 'self';
@@ -594,6 +594,48 @@
     .s-quotafill { height:100%; border-radius:999px; }
     .s-ledger-payout { font-weight:700; color:var(--success); }
     .s-ledger-expense { font-weight:700; color:var(--text); }
+
+    /* ===== In-app print reports (build order: Emergency Card first, see
+       README changelog) ===== 
+       Deliberately NOT the old window.open('',' _blank')+document.write
+       popup approach the other 8 report functions still use - those write
+       an entirely separate document with its own relaxed per-page CSP
+       (see the comment above printEmergency's old window.open call for
+       why). Printing in-page instead means the report HTML lives under
+       this page's OWN (tighter) CSP, so: no inline style block or
+       style="..." attributes in report markup (style-src only allows this
+       hash-locked block, not 'unsafe-inline') - report elements are
+       styled via the plain classes below instead; and no embed/object tag
+       for PDF preview (object-src 'none' here, unlike the popup reports'
+       object-src data:) - PDF pages render via the same pdf.js-to-canvas
+       approach the attachment viewer already uses (see openAttachment).
+       #printContainer is hidden on screen and only shown for @media print,
+       which also hides everything else so only the report comes out.
+       NOTE FOR FUTURE EDITS: this comment must never contain the literal
+       text "style" wrapped in angle brackets, or "/style" wrapped in
+       angle brackets either - regen-style-hash.py locates this block by
+       searching for those exact substrings, and a comment that happens to
+       contain one throws its boundary detection off, silently producing a
+       hash for the wrong span. Ask if a rewrite needs to reference the
+       tag by name; there are ways to phrase it that do not confuse the
+       script. */
+    #printContainer { display: none; }
+    @media print {
+      body > *:not(#printContainer) { display: none !important; }
+      #printContainer { display: block !important; }
+    }
+    .pe-card { border: 3px solid #dc2626; border-radius: 12px; padding: 20px; max-width: 400px; margin: 0 auto; font-family: Arial, sans-serif; }
+    .pe-title { color: #dc2626; text-align: center; margin: 0 0 16px; font-size: 22px; }
+    .pe-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .pe-item { background: #fef2f2; padding: 10px; border-radius: 8px; }
+    .pe-label { font-size: 11px; color: #666; text-transform: uppercase; }
+    .pe-value { font-size: 16px; font-weight: bold; margin-top: 2px; }
+    .pe-full { grid-column: 1 / -1; }
+    .pe-alert { background: #dc2626; color: white; padding: 10px; border-radius: 8px; text-align: center; font-weight: bold; }
+    .pe-footer { text-align:center; color:#666; font-size:12px; margin-top:16px; }
+    .pe-att-img { max-width:100%; border-radius:6px; margin-top:6px; display:block; }
+    .pe-history-value { font-size:14px; }
+    .pe-att-block { margin-top:10px; }
   </style>
 </head>
 <body>
@@ -640,6 +682,7 @@
       <h1>🏥🛡️ Family Health & Shield</h1>
     </div>
     <div class="header-actions">
+      <button class="btn btn-secondary btn-sm" id="btnConflicts" style="display:none;">⚠️ Conflicts (<span id="conflictCount">0</span>)</button>
       <button class="btn btn-secondary btn-sm" id="btnExport">📥 Export All</button>
       <button class="btn btn-secondary btn-sm" id="btnExportMember">📤 Export Member</button>
       <button class="btn btn-secondary btn-sm" id="btnImport">📥 Import</button>
@@ -884,6 +927,20 @@
       <div class="modal-actions">
         <button class="btn btn-secondary" id="btnCancelReminder">Cancel</button>
         <button class="btn btn-primary" id="btnSaveReminder">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Conflict Review Modal (build order step 5) -->
+  <div class="modal-overlay" id="conflictModal">
+    <div class="modal" style="max-width:640px;">
+      <div class="modal-header">⚠️ Review Conflicting Edits</div>
+      <div class="s-06d0d891">
+        These fields or entries were edited on both sides since the last sync. Your device's version is showing for each right now — pick which to keep, or (where offered) keep both as separate entries.
+      </div>
+      <div id="conflictListBody"></div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="btnCloseConflicts">Close</button>
       </div>
     </div>
   </div>
@@ -1240,6 +1297,15 @@
           <label class="form-label">Non-Guaranteed Value</label>
           <input class="form-input" type="number" step="0.01" id="insSNonGuaranteed" placeholder="e.g. 3000">
         </div>
+        <div class="form-group s-506be65f">
+          <label class="form-label">Attachment (statement / proof document)</label>
+          <input type="file" id="insSAttachments" multiple accept="image/*,.pdf" class="s-cb458930">
+          <div class="file-input-area s-29243394" id="insSFileDropArea">
+            <div class="s-c91e236c">📎</div>
+            <div class="s-6378db95">Click to select files</div>
+          </div>
+          <div class="attachment-list" id="insSAttachmentPreview"></div>
+        </div>
         <div class="s-a18aecfa">
           <button type="button" class="btn btn-primary btn-sm" id="insBtnAddSurrenderEntry">+ Add Statement Record</button>
           <button type="button" class="btn btn-secondary btn-sm s-93b8ea5b" id="insBtnCancelSurrenderEdit">Cancel Edit</button>
@@ -1352,6 +1418,9 @@
     </div>
   </div>
 
+  <div id="printContainer"></div>
+
+  <script src="merge-engine.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
