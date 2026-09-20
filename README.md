@@ -139,3 +139,9 @@ const CACHE_VERSION = 'v1';
   **全量导出("Export All")的行为不变**,依然是整份覆盖,这次改动只影响"导出单个成员"这一条路径,详见 `MERGE_SYNC_DESIGN.md` 里的范围说明。
 
   这次改动新增了两个文件(`merge-engine.js`、`merge-engine.test.js`),`service-worker.js` 的预缓存列表(`APP_SHELL`)已加入 `merge-engine.js`,`index.html` 已在 `app.js` 之前加上对应的 `<script>` 标签。没有改 `<style>` 块,不需要重新生成 CSP 哈希。`APP_VERSION`/`APP_VERSION_DATE`(app.js)和 `CACHE_VERSION`(service-worker.js)已同步改成 v39。
+
+- v41(2026-09-20)新增**全局"打印当前页面"按钮**(右下角 🖨️,对齐 Ledger 记账本的 `printCurrentApp()` 做法):点一下就把当前正在看的成员视图(Health 或 Insurance 及其已打开的标签页)直接打印/另存为 PDF。
+  - **实现**:`app.js` 新增 `printCurrentPage()` / `getActivePageTitle()`——在页面顶部临时插入一个 `#printHeader`(应用名、"成员名 — Health/Insurance · 标签页"、打印时间,用 `textContent` 写入,成员名不会被当成 HTML),同时把 `document.title` 改成同名(另存 PDF 时的默认文件名),`afterprint` 后(外加 60 秒兜底定时器)还原。`index.html` 的 `@media print` 块整体重写:隐藏顶栏/侧边栏/标签页/按钮/编辑删除小图标/弹窗/锁屏/版本徽章,并把原本 `height: calc(100vh - 65px)` + 内部滚动的 `.container`/`.main` 展开成普通文档流(否则只会打印一页)。Health Overview 的 "Reports" 卡片和 Insurance Overview 的 "Generate a printable summary" 卡片只有按钮,打印时整张隐藏;保单上的 "Surrender Value" 按钮里带着实际数字,所以打印时保留为纯文字。
+  - **没有改动**:原有的 9 个打印/报告弹窗(Emergency Card、Health Summary、Vaccine、Medication、Lab、BP Log、Growth、Annual、保险报告)保持原样,它们是独立文档、可以勾选附件,跟这次的"打印当前页"是两套并存的功能。
+  - **改了 `<style>` 块**,已用 `regen-style-hash.py` 重新生成 CSP 哈希并同步到 `index.html` 和 `_headers`。`APP_VERSION`/`APP_VERSION_DATE`(app.js)和 `CACHE_VERSION`(service-worker.js)已同步改成 v41。没有新增文件,`APP_SHELL` 不用动。
+  - **已知的旧问题(非本版引入,v40 就有)**:Conflicts 弹窗的 `style="max-width:640px"` 和顶栏 Conflicts 按钮的 `style="display:none;"` 仍是内联 style,会被 CSP 拦截并在控制台报 2 条 "Refused to apply inline style"(弹窗会比预期窄)。

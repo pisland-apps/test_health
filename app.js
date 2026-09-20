@@ -7,8 +7,8 @@
     // Service Worker and has no effect on caching. It does NOT auto-sync with
     // CACHE_VERSION in service-worker.js since they live in different files — bump both
     // together on every deploy. (Reminder comment also left in service-worker.js.)
-    const APP_VERSION = 'v40';
-    const APP_VERSION_DATE = '2026-09-19';
+    const APP_VERSION = 'v41';
+    const APP_VERSION_DATE = '2026-09-20';
     // Populate the badge immediately — app.js is loaded at the end of <body>, so the DOM
     // (including #versionBadge) already exists by the time this line runs. Deliberately
     // done at top level, not inside init()/initAppData(), so it renders before any
@@ -3017,6 +3017,85 @@
           ${rows}
         </div>`;
     }
+
+    // ========== PRINT CURRENT PAGE (v41) ==========
+    // Same idea as the Ledger app's printCurrentApp(): one global 🖨️ button prints whatever
+    // the person is currently looking at -- a member's Health/Insurance view and its open
+    // tab -- rather than a purpose-built report. The heavy lifting is the @media print block
+    // in index.html (hides the header/sidebar/tabs/buttons/modals, un-clips the internally
+    // scrolling .main so it flows across pages); this function only adds a small header
+    // (app name, member + view, print time), retitles the document so "Save as PDF" gets a
+    // sensible filename, and undoes both afterwards. The 9 report popups below (Emergency
+    // Card, Health Summary, ...) are separate and unchanged.
+    const PRINT_HEALTH_TAB_LABELS = { overview: 'Overview', records: 'Records', charts: 'Trends', reminders: 'Reminders' };
+    const PRINT_INS_TAB_LABELS = { overview: 'Overview', policies: 'Policies', claims: 'Claims', reminders: 'Reminders', discontinued: 'Discontinued' };
+
+    // Read straight from the same state renderMain() renders from, so the printed title
+    // always matches what's on screen.
+    function getActivePageTitle() {
+      const m = members.find(x => x.id === currentMemberId);
+      if (!m) return 'Home';
+      if (viewMode === 'insurance') return `${m.name} — Insurance · ${PRINT_INS_TAB_LABELS[insCurrentSubTab] || 'Overview'}`;
+      return `${m.name} — Health · ${PRINT_HEALTH_TAB_LABELS[currentTab] || 'Overview'}`;
+    }
+
+    function printCurrentPage() {
+      // Locked = no data loaded and the lock screen covers everything; nothing to print.
+      const lock = document.getElementById('appLockScreen');
+      if (lock && getComputedStyle(lock).display !== 'none') return;
+
+      const container = document.querySelector('.container');
+      if (!container || !container.parentNode) { window.print(); return; }
+
+      const oldHeader = document.getElementById('printHeader');
+      if (oldHeader) oldHeader.remove();
+
+      const title = getActivePageTitle();
+      // textContent (not innerHTML): the title contains the member's name, which is user input.
+      const header = document.createElement('div');
+      header.id = 'printHeader';
+      const titleEl = document.createElement('div');
+      titleEl.className = 'print-header-title';
+      titleEl.textContent = '🏥🛡️ Family Health & Shield';
+      const subEl = document.createElement('div');
+      subEl.className = 'print-header-sub';
+      subEl.textContent = `${title} · Printed ${new Date().toLocaleString()}`;
+      header.appendChild(titleEl);
+      header.appendChild(subEl);
+      container.parentNode.insertBefore(header, container);
+
+      // Two cards exist purely to launch the report popups -- the Health Overview's "Reports"
+      // card (a row of buttons) and the Insurance Overview's "Generate a printable summary..."
+      // prompt card. Once the buttons are hidden for print they'd be an empty box / a stray
+      // sentence, so leave those cards off the printout entirely.
+      const skipCards = [];
+      document.querySelectorAll('#insBtnOpenReport, [data-report-type]').forEach(el => {
+        const card = el.closest('.card');
+        if (card && !skipCards.includes(card)) skipCards.push(card);
+      });
+      skipCards.forEach(card => card.classList.add('print-skip'));
+
+      const prevDocTitle = document.title;
+      document.title = `Family Health & Shield - ${title}`;
+
+      let cleanedUp = false;
+      let fallbackTimer = null;
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        clearTimeout(fallbackTimer);
+        header.remove();
+        skipCards.forEach(card => card.classList.remove('print-skip'));
+        document.title = prevDocTitle;
+      };
+      // afterprint fires for both "Print" and "Cancel"; the timeout is a guard for the rare
+      // browser/WebView that never fires it, so the temporary title can't get stuck.
+      window.addEventListener('afterprint', cleanup, { once: true });
+      fallbackTimer = setTimeout(cleanup, 60000);
+
+      window.print();
+    }
+    document.getElementById('btnPrintPage').addEventListener('click', printCurrentPage);
 
     // ========== EMERGENCY CARD ==========
     async function printEmergency(memberId) {
