@@ -7,7 +7,7 @@
     // Service Worker and has no effect on caching. It does NOT auto-sync with
     // CACHE_VERSION in service-worker.js since they live in different files — bump both
     // together on every deploy. (Reminder comment also left in service-worker.js.)
-    const APP_VERSION = 'v42';
+    const APP_VERSION = 'v43';
     const APP_VERSION_DATE = '2026-09-20';
     // Populate the badge immediately — app.js is loaded at the end of <body>, so the DOM
     // (including #versionBadge) already exists by the time this line runs. Deliberately
@@ -3063,6 +3063,7 @@
       const isPdfAtt = bloodAttData && (m.bloodTypeAttachment.type !== 'image');
 
       const printContainer = document.getElementById('printContainer');
+      printContainer.innerHTML = ''; // clear any leftover content from a previous cycle before writing fresh content - see the timing note below for why this matters
       printContainer.innerHTML = `
         <div class="pe-card">
           <h1 class="pe-title">🚨 Emergency Medical Info</h1>
@@ -3093,6 +3094,23 @@
       if (isPdfAtt) {
         await renderPdfIntoContainer(bloodAttData, document.getElementById('peBloodPdfSlot'));
       }
+
+      // window.print() was firing immediately after the innerHTML write
+      // above, with no guarantee the browser had actually finished
+      // decoding/painting the freshly-injected content yet - a data: URL
+      // <img> still needs a decode step, and print()'s snapshot can race
+      // ahead of it. That produced exactly the flaky, inconsistent-across-
+      // clicks behavior reported: sometimes the text was ready but not the
+      // image, sometimes the reverse, depending on how far the previous
+      // click's afterprint cleanup (below) had gotten by the time this
+      // click's write happened. Two waits fix it: decode every image
+      // explicitly before proceeding, then double-rAF to guarantee at
+      // least one full paint has actually happened before print() snapshots
+      // the page (a single rAF only guarantees "about to paint", not
+      // "already painted" - the second callback runs after that paint).
+      const imgs = Array.from(printContainer.querySelectorAll('img'));
+      await Promise.all(imgs.map(img => (img.decode ? img.decode().catch(() => {}) : Promise.resolve())));
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
       window.print();
     }
