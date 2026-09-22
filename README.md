@@ -14,7 +14,8 @@
 
 ```
 family-health-shield/
-├── index.html              ← 主应用页面(结构 + 样式)
+├── index.html              ← 主应用页面(结构)
+├── styles.css                ← 主应用样式(原先内联在 index.html 的 <style> 块里,现已拆成外部文件,理由同 app.js)
 ├── app.js                   ← 主应用逻辑(原先内联在 index.html 里,现已拆成外部文件)
 ├── merge-engine.js           ← 单成员导入的字段/条目级合并引擎(纯函数,UMD 封装,浏览器/Node 双环境可用),设计详见 MERGE_SYNC_DESIGN.md
 ├── merge-engine.test.js      ← merge-engine.js 的 Node 测试(`node merge-engine.test.js` 直接跑,不需要额外装测试框架)
@@ -78,9 +79,9 @@ const CACHE_VERSION = 'v1';
 
 应用逻辑现在是独立的 `app.js` 文件,CSP 用 `script-src 'self'` 直接放行,不再依赖哈希白名单(曾经用过 `sha256-...` 哈希锁定内联 `<script>`,但本地算好的哈希在 push 到 GitHub Pages 后经常和线上文件字节对不上,导致整个 App 白屏——具体原因见 `index.html` 头部的设计说明注释)。
 
-**所以现在改 `app.js` 不需要额外步骤**,和改 `index.html` / `manifest.json` 一样,记得同步更新下面这条的 `CACHE_VERSION`,并且部署时要把 `app.js`、`merge-engine.js` 和 `index.html` 一起 push——只推 `index.html` 会导致线上白屏(`index.html` 会去请求不存在的 `app.js`/`merge-engine.js`)。
+**所以现在改 `app.js` 不需要额外步骤**,和改 `index.html` / `manifest.json` 一样,记得同步更新下面这条的 `CACHE_VERSION`,并且部署时要把 `app.js`、`merge-engine.js`、`styles.css` 和 `index.html` 一起 push——只推 `index.html` 会导致线上白屏(`index.html` 会去请求不存在的 `app.js`/`merge-engine.js`/`styles.css`)。
 
-`scripts/update_csp_hash.py` 和 `.githooks/pre-commit` 是旧哈希方案留下的维护脚本,现在用不上了,可以删除。
+`scripts/update_csp_hash.py` 和 `.githooks/pre-commit` 是旧哈希方案留下的维护脚本,现在用不上了,可以删除。2026-09-23 起 `regen-style-hash.py` 也是同一类东西,已经直接删掉了(见下方"安全说明"里 `style-src` 那一条)。
 
 ## 版本号(右下角小徽章)
 
@@ -97,8 +98,8 @@ const CACHE_VERSION = 'v1';
 - 指纹/Face ID 解锁是**逐设备**的便捷登录方式,底层仍然依赖同一把密码派生出的密钥——生物识别只是替你在本机安全地"记住并按下密码"这一步,并不是比密码更强的独立加密层,也不能跨设备使用。
 - 这是一个纯客户端应用,没有服务器,请自行确保设备本身的安全(锁屏、系统账户密码等),因为浏览器本地存储在设备层面通常没有额外保护。
 - 点击劫持防护:`_headers` 里的 `frame-ancestors 'none'` + `X-Frame-Options: DENY` 只有部署在 **Cloudflare Pages**(或其它支持自定义响应头的静态托管)上才会生效——这是 HTTP 响应头级别的保护,`_headers` 文件本身在 GitHub Pages 上会被直接忽略。
-- CSP `style-src`(2026-08-10 起收紧为 `'self'` 加一个 `<style>` 块内容的哈希,不再有 `'unsafe-inline'`):主界面(index.html + app.js 渲染主界面的部分)原来约 285 处内联 `style="..."` 已全部改成预生成的 CSS class,详见 `index.html` 里 `<style>` 块末尾的注释和 CSP `<meta>` 上方的设计说明。**例外**:9 个打印/报告弹窗(BP 记录、用药清单、保单摘要等)仍然使用内联样式,但每个弹窗现在都在自己的文档里带了一份独立、明确写出来的 CSP `<meta>`(而不是隐式沿用或不受约束),细节见 app.js 里 `printEmergency` 函数上方的注释——这是刻意的范围划分,不是遗漏。
-- ⚠️ **改 `index.html` 里 `<style>` 块的 CSS 之前必读**:style-src 现在靠一个精确到字节的 CSS 哈希放行主样式表,而不是笼统的 `'unsafe-inline'`。这意味着改动 `<style>` 块里任何一条规则(哪怕只加一行)都会让这个哈希失效——浏览器不会报错也不会降级,而是直接整体拒绝这份样式表,页面瞬间变成没有任何样式的纯文字(2026-08-10 上线时真实发生过一次,起因是收紧 CSP 时漏算了这一点)。**改完 CSS 后必须跑一次** `python3 regen-style-hash.py`,把打印出来的新哈希**同时**贴到两个地方:`index.html` 里 CSP `<meta>` 的 `style-src` 那一行,以及 `_headers` 文件里 `Content-Security-Policy` 的 `style-src` 那一段——两处必须完全一致,浏览器会取两份 CSP 的交集执行,漏改任何一处页面照样会裸奔。
+- CSP `style-src`(2026-08-10 起收紧为 `'self'`,不再有 `'unsafe-inline'`):主界面(index.html + app.js 渲染主界面的部分)原来约 285 处内联 `style="..."` 已全部改成预生成的 CSS class,详见 `styles.css` 末尾的注释。**例外**:9 个打印/报告弹窗(BP 记录、用药清单、保单摘要等)仍然使用内联样式,但每个弹窗现在都在自己的文档里带了一份独立、明确写出来的 CSP `<meta>`(而不是隐式沿用或不受约束),细节见 app.js 里 `printEmergency` 函数上方的注释——这是刻意的范围划分,不是遗漏。
+- **2026-09-23:CSS 从内联 `<style>` 块搬到了外部 `styles.css` 文件,`style-src` 不再需要哈希。** 在此之前,`style-src` 靠一个精确到字节的 CSS 哈希放行主样式表:改动 `<style>` 块里任何一条规则(哪怕只加一行)都会让哈希失效,浏览器不报错也不降级,直接整体拒绝样式表,页面瞬间变成没有任何样式的纯文字——这个故障类别真实发生过两次(2026-08-10 上线时漏算了哈希;2026-09-20 的 v41→v42 是 `regen-style-hash.py` 自身的边界情况 bug,算出了一个看起来正常但其实对不上的哈希),每次都得等截图/用户反馈才发现,控制台没有任何报错提示。现在跟 `app.js`(`script-src 'self'`,同样在 2026-08-09 之前就已经这样做了)是完全一样的模式:外部文件天然被 `'self'` 覆盖,改 CSS 不需要任何额外步骤,`regen-style-hash.py` 连同它要解决的问题一起已经删掉。
 - 第三方库是 vendor 进仓库的本地文件(`lib/jszip.min.js`、`lib/pdf.min.mjs` + `lib/pdf.worker.min.mjs`),不会跟着 npm 自动更新。建议**每季度手动检查一次**上游是否有新版本/安全公告(jszip: https://github.com/Stuk/jszip/releases ,pdf.js: https://github.com/mozilla/pdf.js/releases ),有的话下载新的 `.min.js`/`.min.mjs` 文件直接替换,不需要改代码(除非上游有 breaking change)。
 - v23/v24(2026-08-12)安全加固:
   1. **导入备份文件的输入校验**:`normalizeImportedMembers()` 之前只把导入 JSON 里的各种 `.id` 字段做 `String()` 类型转换,没有校验内容;这些 id 又被多处 `innerHTML` 拼接时直接使用(没有 `escapeHtml()`,因为假设 id 一定是内部生成的安全字符串)。一份精心构造的备份文件因此可以把任意 HTML/脚本注入进渲染出的页面(尤其是 9 个打印弹窗,那里 CSP 允许内联脚本执行)。现在导入的 id 会先做白名单校验(`sanitizeId()`/`sanitizeIdsDeep()`),不合法就重新生成;导入的 `vitals` 数值字段也会跟手动录入表单一样做 `parseFloat()` 校验(`sanitizeVitals()`)。同时把所有 `.id` 拼接进 `innerHTML` 的地方(约 37 处)统一加上 `escapeHtml()` 作为纵深防御。
@@ -160,3 +161,6 @@ const CACHE_VERSION = 'v1';
   **每一步都有做防呆,不是改完就直接扔上去**:CSS 改完先用加固过的 `regen-style-hash.py` 跑一遍(这次特意确认脚本没有报错才继续,并且另外用 `openssl` 独立算一遍交叉核对,不只信脚本自己的结果),再统一把 `index.html` 和 `_headers` 两处同步更新,最后又跑了一遍脚本确认两边哈希内容对得上。写 CSS 注释时也刻意避开写出带尖括号的标签名(v42 教训)。
 
   这次原来每个报告弹窗上都有的"🖨️ Print This Report"手动按钮拿掉了,改成跟 Emergency Card 一样生成内容后直接自动弹出浏览器打印对话框——选附件的"预览"步骤本来就是在报告生成之前的另一个弹窗完成,所以这里不再需要一个额外的"确认后才印"按钮。`APP_VERSION`/`CACHE_VERSION` 已同步改成 v44。
+- v45(2026-09-23)把 v41-v44 那一整类"改 CSS 忘了/算错哈希导致整个 App 裸奔"的故障从根上消除:主文档的 CSS 从内联 `<style>` 块搬到了外部 `styles.css` 文件(`index.html` 里改成 `<link rel="stylesheet" href="styles.css">`),`style-src` 从 `'self' '<sha256 哈希>'` 简化成单纯的 `'self'`——外部样式表文件天然被 `'self'` 覆盖,不再需要哈希,思路跟这个项目更早之前把内联 `<script>` 挪成外部 `app.js`(`script-src 'self'`)完全一样。
+
+  连带清理:`regen-style-hash.py` 已经删掉(它存在的唯一理由——算哈希——已经不存在了);`service-worker.js` 的 `APP_SHELL` 预缓存列表加入了 `./styles.css`;`_headers` 的 `style-src` 同步去掉了哈希。以后改 `styles.css` 里任何一条 CSS 规则,跟改 `app.js` 一样不需要任何额外步骤——不用跑脚本,不用同步两处哈希,也就不存在"两处哈希没对齐导致裸奔"这一整类问题了。部署时记得把 `styles.css` 和 `app.js`、`merge-engine.js`、`index.html` 一起 push(见上方"修改了 `app.js` 之后"一节)。`APP_VERSION`/`CACHE_VERSION` 已同步改成 v45。
